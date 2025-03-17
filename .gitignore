@@ -1,0 +1,10 @@
+/deepseek-7b
+/IFLYTEK_ASR-main
+data/audio
+data/audio_mp3
+figure
+audio_channels_report.csv
+asr/__pycache__
+data/split_audio
+data/transcriptions
+data/label_all.csv

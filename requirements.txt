@@ -1,0 +1,10 @@
+librosa==0.10.1
+matplotlib==3.7.1
+numpy==1.23.5
+pandas==2.2.3
+pydub==0.25.1
+Requests==2.32.3
+scikit_learn==1.2.2
+torch==2.4.0
+tqdm==4.66.4
+transformers==4.44.0
