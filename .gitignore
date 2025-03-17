@@ -8,3 +8,4 @@ asr/__pycache__
 data/split_audio
 data/transcriptions
 data/label_all.csv
+asr/config.py
