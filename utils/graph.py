@@ -27,12 +27,15 @@ class Node:
     def aggregate_features(self, method='mean'):
         """将原始特征聚合为固定维度向量"""
         if isinstance(self.utterance_features, torch.Tensor) and self.utterance_features.ndim == 2:
-            if method == 'mean':
+            # 如果token_len为1，直接使用而不进行聚合
+            if self.utterance_features.shape[0] == 1:
+                self.aggregated_feature = self.utterance_features.squeeze(0)
+            elif method == 'mean':
                 self.aggregated_feature = torch.mean(self.utterance_features, dim=0)
             elif method == 'max':
                 self.aggregated_feature = torch.max(self.utterance_features, dim=0)[0]
             else:
-                 # Default to mean pooling if method unknown or feature is already 1D
+                 # Default to mean pooling if method unknown
                  self.aggregated_feature = torch.mean(self.utterance_features, dim=0)
         elif isinstance(self.utterance_features, torch.Tensor) and self.utterance_features.ndim == 1:
              self.aggregated_feature = self.utterance_features # Already aggregated
@@ -363,28 +366,26 @@ class DialogueGraph:
 class MultiHeadAttention(nn.Module):
     """使用PyTorch官方nn.MultiheadAttention实现的图注意力机制"""
     
-    def __init__(self, in_features, out_features, num_heads, dropout=0.2, num_edge_types=4):
+    def __init__(self, dim, num_heads, dropout=0.2, num_edge_types=4):
         """
         初始化多头注意力模块
         
         参数:
-            in_features: 输入特征维度 (聚合后的维度)
-            out_features: 输出特征维度 (需要能被 num_heads 整除)
+            dim: 特征维度 (输入输出维度相同)
             num_heads: 注意力头数量
             dropout: Dropout概率
             num_edge_types: 边类型的数量，默认为4
         """
         super(MultiHeadAttention, self).__init__()
         
-        # 确保out_features可被num_heads整除
-        if out_features % num_heads != 0:
-            print(f"Warning: out_features ({out_features}) not divisible by num_heads ({num_heads}). Adjusting out_features.")
-            out_features = (out_features // num_heads) * num_heads
-            if out_features == 0:
-                raise ValueError("out_features becomes 0 after adjustment.")
+        # 确保dim可被num_heads整除
+        if dim % num_heads != 0:
+            print(f"Warning: dim ({dim}) not divisible by num_heads ({num_heads}). Adjusting dim.")
+            dim = (dim // num_heads) * num_heads
+            if dim == 0:
+                raise ValueError("dim becomes 0 after adjustment.")
         
-        self.in_features = in_features
-        self.out_features = out_features
+        self.dim = dim
         self.num_heads = num_heads
         self.num_edge_types = num_edge_types
         
@@ -392,14 +393,14 @@ class MultiHeadAttention(nn.Module):
         # 初始化为全1，表示所有边类型初始时具有相同的重要性
         self.edge_type_weights = nn.Parameter(torch.ones(num_edge_types))
         
-        # 为保持与GAT兼容性，添加投影层
-        self.q_proj = nn.Linear(in_features, out_features)
-        self.k_proj = nn.Linear(in_features, out_features)
-        self.v_proj = nn.Linear(in_features, out_features)
+        # 投影层 - 保持输入输出维度相同
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
         
         # 使用PyTorch官方的多头注意力实现
         self.attn = nn.MultiheadAttention(
-            embed_dim=out_features,
+            embed_dim=dim,
             num_heads=num_heads,
             dropout=dropout,
             batch_first=True
@@ -413,22 +414,22 @@ class MultiHeadAttention(nn.Module):
         前向传播
         
         参数:
-            x: 节点特征矩阵 [num_nodes, in_features] (聚合后的特征)
+            x: 节点特征矩阵 [num_nodes, dim] (聚合后的特征)
             edge_index: 边索引 [2, num_edges]
-            edge_type: 边类型 [num_edges]，如果为None则所有边被视为相同类型
+            edge_type: 边类型 [num_edges]如果为None则所有边被视为相同类型
             
         返回:
-            输出特征矩阵 [num_nodes, out_features]
+            输出特征矩阵 [num_nodes, dim]
         """
         num_nodes = x.size(0)
         if num_nodes == 0 or edge_index.numel() == 0:
             # 处理空图或无边的情况
-            return torch.zeros(num_nodes, self.out_features, device=x.device)
+            return torch.zeros(num_nodes, self.dim, device=x.device)
             
         # 投影查询、键和值
-        query = self.q_proj(x).unsqueeze(0)  # [1, num_nodes, out_features]
-        key = self.k_proj(x).unsqueeze(0)    # [1, num_nodes, out_features]
-        value = self.v_proj(x).unsqueeze(0)  # [1, num_nodes, out_features]
+        query = self.q_proj(x).unsqueeze(0)  # [1, num_nodes, dim]
+        key = self.k_proj(x).unsqueeze(0)    # [1, num_nodes, dim]
+        value = self.v_proj(x).unsqueeze(0)  # [1, num_nodes, dim]
         
         # 构建基础注意力掩码（所有位置初始化为-inf，表示不允许注意力）
         attn_mask = torch.full((num_nodes, num_nodes), float('-inf'), device=x.device)
@@ -462,221 +463,199 @@ class MultiHeadAttention(nn.Module):
             
         # 应用多头注意力
         output, _ = self.attn(
-            query=query,           # [1, num_nodes, out_features]
-            key=key,               # [1, num_nodes, out_features]
-            value=value,           # [1, num_nodes, out_features]
+            query=query,           # [1, num_nodes, dim]
+            key=key,               # [1, num_nodes, dim]
+            value=value,           # [1, num_nodes, dim]
             attn_mask=attn_mask,   # [num_nodes, num_nodes]
             need_weights=False     # 不需要返回注意力权重
         )
         
         # 删除批次维度并应用dropout
-        output = output.squeeze(0)  # [num_nodes, out_features]
+        output = output.squeeze(0)  # [num_nodes, dim]
         output = self.dropout_layer(output)
         
         return output
 
 
-class DebugMultiHeadAttention(nn.Module):
-    """调试版本的多头注意力机制，返回注意力权重用于分析"""
+# class DebugMultiHeadAttention(nn.Module):
+#     """调试版本的多头注意力机制，返回注意力权重用于分析"""
     
-    def __init__(self, in_features, out_features, num_heads, dropout=0.2, num_edge_types=4):
-        """初始化参数与原版保持一致"""
-        super(DebugMultiHeadAttention, self).__init__()
+#     def __init__(self, dim, num_heads, dropout=0.2, num_edge_types=4):
+#         """
+#         初始化调试版本多头注意力模块
         
-        # 确保out_features可被num_heads整除
-        if out_features % num_heads != 0:
-            print(f"Warning: out_features ({out_features}) not divisible by num_heads ({num_heads}). Adjusting out_features.")
-            out_features = (out_features // num_heads) * num_heads
-            if out_features == 0:
-                raise ValueError("out_features becomes 0 after adjustment.")
+#         参数:
+#             dim: 特征维度 (输入输出维度相同)
+#             num_heads: 注意力头数量
+#             dropout: Dropout概率
+#             num_edge_types: 边类型的数量，默认为4
+#         """
+#         super(DebugMultiHeadAttention, self).__init__()
         
-        self.in_features = in_features
-        self.out_features = out_features
-        self.num_heads = num_heads
-        self.num_edge_types = num_edge_types
+#         # 确保dim可被num_heads整除
+#         if dim % num_heads != 0:
+#             print(f"Warning: dim ({dim}) not divisible by num_heads ({num_heads}). Adjusting dim.")
+#             dim = (dim // num_heads) * num_heads
+#             if dim == 0:
+#                 raise ValueError("dim becomes 0 after adjustment.")
         
-        # 为每种边类型添加可学习的权重参数
-        self.edge_type_weights = nn.Parameter(torch.ones(num_edge_types))
+#         self.dim = dim
+#         self.num_heads = num_heads
+#         self.num_edge_types = num_edge_types
         
-        # 投影层
-        self.q_proj = nn.Linear(in_features, out_features)
-        self.k_proj = nn.Linear(in_features, out_features)
-        self.v_proj = nn.Linear(in_features, out_features)
+#         # 为每种边类型添加可学习的权重参数
+#         self.edge_type_weights = nn.Parameter(torch.ones(num_edge_types))
         
-        # 多头注意力
-        self.attn = nn.MultiheadAttention(
-            embed_dim=out_features,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
+#         # 投影层 - 保持输入输出维度相同
+#         self.q_proj = nn.Linear(dim, dim)
+#         self.k_proj = nn.Linear(dim, dim)
+#         self.v_proj = nn.Linear(dim, dim)
         
-        self.dropout_layer = nn.Dropout(dropout)
+#         # 多头注意力
+#         self.attn = nn.MultiheadAttention(
+#             embed_dim=dim,
+#             num_heads=num_heads,
+#             dropout=dropout,
+#             batch_first=True
+#         )
         
-    def forward(self, x, edge_index, edge_type=None, return_attention=True):
-        """
-        前向传播，返回节点表示和注意力权重
+#         self.dropout_layer = nn.Dropout(dropout)
         
-        参数:
-            x: 节点特征矩阵 [num_nodes, in_features]
-            edge_index: 边索引 [2, num_edges]
-            edge_type: 边类型 [num_edges]
-            return_attention: 是否返回注意力权重
+#     def forward(self, x, edge_index, edge_type=None, return_attention=True):
+#         """
+#         前向传播，返回节点表示和注意力权重
+        
+#         参数:
+#             x: 节点特征矩阵 [num_nodes, dim]
+#             edge_index: 边索引 [2, num_edges]
+#             edge_type: 边类型 [num_edges]
+#             return_attention: 是否返回注意力权重
             
-        返回:
-            output: 输出特征矩阵 [num_nodes, out_features]
-            attn_weights: 注意力权重 [batch_size, num_nodes, num_nodes]
-            edge_weights: 边类型权重 [num_edge_types]
-            attn_mask: 注意力掩码矩阵 [num_nodes, num_nodes]
-        """
-        num_nodes = x.size(0)
-        if num_nodes == 0 or edge_index.numel() == 0:
-            if return_attention:
-                return (torch.zeros(num_nodes, self.out_features, device=x.device), 
-                        None, self.edge_type_weights, None)
-            else:
-                return torch.zeros(num_nodes, self.out_features, device=x.device)
+#         返回:
+#             output: 输出特征矩阵 [num_nodes, dim]
+#             attn_weights: 注意力权重 [batch_size, num_nodes, num_nodes]
+#             edge_weights: 边类型权重 [num_edge_types]
+#             attn_mask: 注意力掩码矩阵 [num_nodes, num_nodes]
+#         """
+#         num_nodes = x.size(0)
+#         if num_nodes == 0 or edge_index.numel() == 0:
+#             if return_attention:
+#                 return (torch.zeros(num_nodes, self.dim, device=x.device), 
+#                         None, self.edge_type_weights, None)
+#             else:
+#                 return torch.zeros(num_nodes, self.dim, device=x.device)
             
-        # 投影查询、键和值
-        query = self.q_proj(x).unsqueeze(0)  # [1, num_nodes, out_features]
-        key = self.k_proj(x).unsqueeze(0)    # [1, num_nodes, out_features]
-        value = self.v_proj(x).unsqueeze(0)  # [1, num_nodes, out_features]
+#         # 投影查询、键和值
+#         query = self.q_proj(x).unsqueeze(0)  # [1, num_nodes, dim]
+#         key = self.k_proj(x).unsqueeze(0)    # [1, num_nodes, dim]
+#         value = self.v_proj(x).unsqueeze(0)  # [1, num_nodes, dim]
         
-        # 构建注意力掩码
-        attn_mask = torch.full((num_nodes, num_nodes), float('-inf'), device=x.device)
+#         # 构建注意力掩码
+#         attn_mask = torch.full((num_nodes, num_nodes), float('-inf'), device=x.device)
         
-        src_nodes, dst_nodes = edge_index
+#         src_nodes, dst_nodes = edge_index
         
-        # 创建一个字典记录边类型到权重的映射，用于调试
-        edge_type_to_weight = {}
+#         # 创建一个字典记录边类型到权重的映射，用于调试
+#         edge_type_to_weight = {}
         
-        if edge_type is not None:
-            # 使用边类型权重
-            for i in range(edge_index.shape[1]):
-                src, dst = src_nodes[i], dst_nodes[i]
-                e_type_idx = edge_type[i].item() - 1
-                weight = F.softplus(self.edge_type_weights[e_type_idx])
-                attn_mask[src, dst] = weight
+#         if edge_type is not None:
+#             # 使用边类型权重
+#             for i in range(edge_index.shape[1]):
+#                 src, dst = src_nodes[i], dst_nodes[i]
+#                 e_type_idx = edge_type[i].item() - 1
+#                 weight = F.softplus(self.edge_type_weights[e_type_idx])
+#                 attn_mask[src, dst] = weight
                 
-                # 记录边类型到权重的映射
-                if e_type_idx not in edge_type_to_weight:
-                    edge_type_to_weight[e_type_idx] = weight.item()
-        else:
-            attn_mask[src_nodes, dst_nodes] = 1.0
+#                 # 记录边类型到权重的映射
+#                 if e_type_idx not in edge_type_to_weight:
+#                     edge_type_to_weight[e_type_idx] = weight.item()
+#         else:
+#             attn_mask[src_nodes, dst_nodes] = 1.0
             
-        # 添加自环
-        for i in range(num_nodes):
-            if attn_mask[i, i] == float('-inf'):
-                if edge_type is not None:
-                    self_loop_type_idx = 3  # 自环边类型索引
-                    weight = F.softplus(self.edge_type_weights[self_loop_type_idx])
-                    attn_mask[i, i] = weight
+#         # 添加自环
+#         for i in range(num_nodes):
+#             if attn_mask[i, i] == float('-inf'):
+#                 if edge_type is not None:
+#                     self_loop_type_idx = 3  # 自环边类型索引
+#                     weight = F.softplus(self.edge_type_weights[self_loop_type_idx])
+#                     attn_mask[i, i] = weight
                     
-                    # 记录自环边权重
-                    if self_loop_type_idx not in edge_type_to_weight:
-                        edge_type_to_weight[self_loop_type_idx] = weight.item()
-                else:
-                    attn_mask[i, i] = 1.0
+#                     # 记录自环边权重
+#                     if self_loop_type_idx not in edge_type_to_weight:
+#                         edge_type_to_weight[self_loop_type_idx] = weight.item()
+#                 else:
+#                     attn_mask[i, i] = 1.0
             
-        # 应用多头注意力，返回注意力权重
-        output, attn_weights = self.attn(
-            query=query,
-            key=key,
-            value=value,
-            attn_mask=attn_mask,
-            need_weights=return_attention
-        )
+#         # 应用多头注意力，返回注意力权重
+#         output, attn_weights = self.attn(
+#             query=query,
+#             key=key,
+#             value=value,
+#             attn_mask=attn_mask,
+#             need_weights=return_attention
+#         )
         
-        output = output.squeeze(0)
-        output = self.dropout_layer(output)
+#         output = output.squeeze(0)
+#         output = self.dropout_layer(output)
         
-        if return_attention:
-            edge_weights = {t+1: edge_type_to_weight[t] for t in edge_type_to_weight}
-            return output, attn_weights, edge_weights, attn_mask
-        else:
-            return output
+#         if return_attention:
+#             edge_weights = {t+1: edge_type_to_weight[t] for t in edge_type_to_weight}
+#             return output, attn_weights, edge_weights, attn_mask
+#         else:
+#             return output
 
 
 class GraphAttentionNetwork(nn.Module):
     """图注意力网络，用于对话图的节点表示学习"""
     
-    def __init__(self, aggregated_input_dim, hidden_dim, output_dim, num_heads,
-                 speaker_embedding_dim=None, num_speakers=None, num_layers=2, dropout=0.2):
+    def __init__(self, dim, num_heads, speaker_embedding_dim=None, 
+                 num_speakers=None, num_layers=2, dropout=0.2):
         """
         初始化图注意力网络
         
         参数:
-            aggregated_input_dim: 聚合后的节点特征维度
-            hidden_dim: GAT 隐藏层维度 (注意：要能被 num_heads 整除)
-            output_dim: GAT 输出特征维度 (注意：要能被 num_heads 整除)
+            dim: 特征维度 (输入输出维度相同)
             num_heads: 注意力头数量
-            speaker_embedding_dim: 说话者嵌入维度，若为None则设为等于aggregated_input_dim
+            speaker_embedding_dim: 说话者嵌入维度，若为None则设为等于dim
             num_speakers: 说话者数量，None表示动态确定
             num_layers: 图注意力层数量
             dropout: Dropout概率
         """
         super(GraphAttentionNetwork, self).__init__()
-        # Ensure hidden_dim and output_dim are divisible by num_heads for concatenation
-        if hidden_dim % num_heads != 0:
-             print(f"Warning: hidden_dim ({hidden_dim}) not divisible by num_heads ({num_heads}). Adjusting hidden_dim.")
-             hidden_dim = (hidden_dim // num_heads) * num_heads
-             if hidden_dim == 0: raise ValueError("hidden_dim becomes 0 after adjustment.")
-        if num_layers > 1 and output_dim % num_heads != 0: # Output layer might aggregate differently if num_layers=1
-             print(f"Warning: output_dim ({output_dim}) not divisible by num_heads ({num_heads}). Adjusting output_dim.")
-             output_dim = (output_dim // num_heads) * num_heads
-             if output_dim == 0: raise ValueError("output_dim becomes 0 after adjustment.")
-        elif num_layers == 1 and output_dim % num_heads != 0:
-            # If only one layer, the output layer IS the first layer.
-            # We might allow aggregation (like mean) instead of concat here, or force divisibility.
-            # Forcing divisibility for simplicity.
-            print(f"Warning: output_dim ({output_dim}) not divisible by num_heads ({num_heads}) for single GAT layer. Adjusting output_dim.")
-            output_dim = (output_dim // num_heads) * num_heads
-            if output_dim == 0: raise ValueError("output_dim becomes 0 after adjustment.")
+        
+        # 确保dim可被num_heads整除
+        if dim % num_heads != 0:
+            print(f"Warning: dim ({dim}) not divisible by num_heads ({num_heads}). Adjusting dim.")
+            dim = (dim // num_heads) * num_heads
+            if dim == 0:
+                raise ValueError("dim becomes 0 after adjustment.")
 
-
-        self.aggregated_input_dim = aggregated_input_dim
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
+        self.dim = dim
         self.num_heads = num_heads
         self.num_layers = num_layers
-        self.num_edge_types = 4 # Fixed based on description
+        self.num_edge_types = 4  # 固定基于描述
         
         # 若未指定speaker_embedding_dim，则设为与节点特征维度相同
         if speaker_embedding_dim is None:
-            speaker_embedding_dim = aggregated_input_dim
+            speaker_embedding_dim = dim
 
         # 说话者嵌入层
         self.speaker_embedding = SpeakerEmbedding(speaker_embedding_dim, num_speakers)
         
         # 注意：现在说话人嵌入维度与节点特征维度相同，因此传入投影层的是双倍维度
-        combined_dim = aggregated_input_dim + speaker_embedding_dim
+        combined_dim = dim + speaker_embedding_dim
 
-        # 输入特征投影
-        self.input_projection = nn.Linear(combined_dim, hidden_dim)
+        # 输入特征投影 (将合并的特征投影回原始维度)
+        self.input_projection = nn.Linear(combined_dim, dim)
 
-        # 图注意力层
+        # 图注意力层 - 所有层使用相同的输入输出维度
         self.gat_layers = nn.ModuleList()
-        if num_layers == 1:
-             # Directly map projected input to output
-             self.gat_layers.append(
-                 MultiHeadAttention(hidden_dim, output_dim, num_heads, dropout) # Pass dropout to MultiHeadAttention
-             )
-        else:
-            # First layer: projected_dim -> hidden_dim
+        for _ in range(num_layers):
             self.gat_layers.append(
-                MultiHeadAttention(hidden_dim, hidden_dim, num_heads, dropout)
-            )
-            # Intermediate layers: hidden_dim -> hidden_dim
-            for _ in range(num_layers - 2):
-                self.gat_layers.append(
-                    MultiHeadAttention(hidden_dim, hidden_dim, num_heads, dropout)
-                )
-            # Output layer: hidden_dim -> output_dim
-            self.gat_layers.append(
-                MultiHeadAttention(hidden_dim, output_dim, num_heads, dropout)
+                MultiHeadAttention(dim, num_heads, dropout)
             )
 
-        self.dropout_layer = nn.Dropout(dropout) # Used between layers
+        self.dropout_layer = nn.Dropout(dropout)  # 用于层间
         self.activation = nn.ELU()
 
     def forward(self, aggregated_x, speaker_ids, edge_index, edge_type=None):
@@ -684,35 +663,33 @@ class GraphAttentionNetwork(nn.Module):
         前向传播
         
         参数:
-            aggregated_x: 聚合后的话语特征矩阵 [num_nodes, aggregated_input_dim]
+            aggregated_x: 聚合后的话语特征矩阵 [num_nodes, dim]
             speaker_ids: 说话者ID [num_nodes]
             edge_index: 边索引 [2, num_edges]
             edge_type: 边类型 [num_edges]，如果为None则所有边被视为相同类型
             
         返回:
-            节点的最终表示 [num_nodes, output_dim]
+            节点的最终表示 [num_nodes, dim]
         """
         # 1. 计算说话者嵌入
         speaker_emb = self.speaker_embedding(speaker_ids)  # [num_nodes, speaker_embedding_dim]
 
         # 2. 拼接聚合特征和说话者嵌入
-        x = torch.cat([aggregated_x, speaker_emb], dim=1)  # [num_nodes, aggregated_input_dim + speaker_embedding_dim]
+        x = torch.cat([aggregated_x, speaker_emb], dim=1)  # [num_nodes, dim + speaker_embedding_dim]
 
         # 3. 投影到隐藏维度
-        x = self.input_projection(x)  # [num_nodes, hidden_dim]
-        # Apply activation and dropout after projection, before first GAT layer
+        x = self.input_projection(x)  # [num_nodes, dim]
+        # 应用激活函数和dropout，在第一个GAT层之前
         x = self.activation(x)
         x = self.dropout_layer(x)
 
-
         # 4. 应用图注意力层
         for i, gat_layer in enumerate(self.gat_layers):
-            x = gat_layer(x, edge_index, edge_type) # 传递边类型
-            # Apply activation and dropout *between* GAT layers (not after the last one)
+            x = gat_layer(x, edge_index, edge_type)  # 传递边类型
+            # 在GAT层之间应用激活函数和dropout（不在最后一层之后）
             if i < self.num_layers - 1:
                  x = self.activation(x)
                  x = self.dropout_layer(x)
-
 
         return x
 
@@ -857,11 +834,9 @@ class DialogueGraphModel(nn.Module):
             output_dim = num_heads  # 最小可能值
             print(f"Warning: output_dim was adjusted to minimum value: {output_dim}")
 
-        # 图注意力网络 (输入维度是 token_embedding_dim)
+        # 图注意力网络 (使用正确的参数调用GraphAttentionNetwork)
         self.gat = GraphAttentionNetwork(
-            aggregated_input_dim=token_embedding_dim,
-            hidden_dim=hidden_dim,
-            output_dim=output_dim,
+            dim=hidden_dim,  # 使用hidden_dim作为GAT的dim参数
             num_heads=num_heads,
             speaker_embedding_dim=speaker_embedding_dim,
             num_speakers=num_speakers,

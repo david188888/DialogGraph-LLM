@@ -489,8 +489,7 @@ try:
             
             # 使用DebugMultiHeadAttention
             self.attention = DebugMultiHeadAttention(
-                in_features=token_embedding_dim,
-                out_features=output_dim,
+                dim= token_embedding_dim,
                 num_heads=num_heads,
                 dropout=0.0,
                 num_edge_types=num_edge_types

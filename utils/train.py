@@ -13,9 +13,12 @@ import wandb
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from torchvision import transforms
 import random
+import sys
 
 from utils.graph import DialogueGraphModel
 from utils.audio_augment import AudioAugmenter
+from utils.dataloader import create_telemarketing_dataloader
+from utils.model import AudioEncoder
 
 # 设置日志
 logging.basicConfig(
@@ -325,7 +328,7 @@ class AudioDialogueDataset(Dataset):
             return f"[特征统计: {stats}]"
         elif isinstance(features, torch.Tensor):
             # 如果是1D张量，只取前几个值和基本统计量
-            if len(features) > 5:
+            if (len(features) > 5):
                 return f"[特征样本: {features[:5].tolist()}, 均值: {features.mean().item():.3f}]"
             else:
                 return str(features.tolist())
@@ -444,80 +447,42 @@ class AudioDialogueDataset(Dataset):
 
 
 class AdaptiveThresholdTrainer:
-    """半监督自适应阈值微调训练器, 整合FixMatch算法和类别自适应阈值策略"""
+    """适应性音频分段训练器，支持Qwen Omni模型训练"""
     
     def __init__(
         self, 
-        model_name, 
+        model,
+        processor,
         graph_config, 
         output_dir, 
         device="cuda",
         learning_rate=5e-5,
         weight_decay=0.01,
-        lora_r=8,
-        lora_alpha=16,
-        lora_dropout=0.1,
-        threshold_init=0.7,
-        threshold_momentum=0.7,
-        confidence_weight=0.5,
-        ema_decay=0.999,  # 指数移动平均衰减率
-        num_classes=4,    # 分类任务的类别数量
-        class_threshold_momentum=0.9  # 类别阈值的EMA动量
+        segment_loss_weight=0.5,
+        num_classes=4
     ):
         """
         初始化训练器
         
         参数:
-            model_name: 预训练模型名称
+            model: Qwen Omni 模型
+            processor: Qwen Omni 处理器
             graph_config: 图模型配置
             output_dir: 输出目录
             device: 设备
             learning_rate: 学习率
             weight_decay: 权重衰减
-            lora_r: LoRA秩
-            lora_alpha: LoRA缩放因子
-            lora_dropout: LoRA dropout概率
-            threshold_init: 阈值初始值
-            threshold_momentum: 阈值动量
-            confidence_weight: 置信度权重
-            ema_decay: 指数移动平均衰减率
+            segment_loss_weight: 片段损失权重
             num_classes: 分类任务的类别数量
-            class_threshold_momentum: 类别阈值的EMA动量
         """
-        self.model_name = model_name
+        self.model = model
+        self.processor = processor
         self.output_dir = output_dir
         self.device = device
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
-        
-        # LoRA配置
-        self.lora_config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            target_modules=["query_key_value", "attn.c_proj", "mlp.c_fc", "mlp.c_proj"], # 这个是关于Lora模块
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM"
-        )
-        
-        # 全局自适应阈值参数
-        self.threshold = threshold_init
-        self.threshold_momentum = threshold_momentum
-        self.confidence_weight = confidence_weight
-        
-        # 指数移动平均衰减率
-        self.ema_decay = ema_decay
-        
-        # 类别自适应阈值参数
+        self.segment_loss_weight = segment_loss_weight
         self.num_classes = num_classes
-        self.class_threshold_momentum = class_threshold_momentum
-        # 初始化每个类别的阈值
-        self.class_thresholds = torch.ones(num_classes, device=device) * threshold_init
-        # 类别概率的EMA
-        self.class_probs_ema = torch.ones(num_classes, device=device) / num_classes
-        
-        # 初始化模型和分词器
-        self._init_model_and_tokenizer()
         
         # 初始化图模型
         self.graph_model = DialogueGraphModel(**graph_config).to(device)
@@ -525,40 +490,11 @@ class AdaptiveThresholdTrainer:
         # 初始化优化器
         self._init_optimizer()
         
-        # 动态损失权重
-        self.labeled_weight = 1.0
-        self.unlabeled_weight = 0.0  # 初始时不使用无标签数据
-        
-    def _init_model_and_tokenizer(self):
-        """初始化模型和分词器"""
-        logger.info(f"加载模型: {self.model_name}")
-        
-
-        
-        # 加载分词器
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-        
-        # 加载模型
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
-            device_map=self.device
-        )
-        
-        # 准备模型进行低精度训练
-        self.model = prepare_model_for_kbit_training(self.model)
-        
-        # 应用LoRA
-        self.model = get_peft_model(self.model, self.lora_config)
-        
-        # 将模型移动到指定设备
-        self.model.to(self.device)
-        
     def _init_optimizer(self):
         """初始化优化器"""
         # 收集需要优化的参数
         optimizer_grouped_parameters = [
-            # LoRA参数
+            # 模型参数
             {
                 "params": [p for n, p in self.model.named_parameters() if p.requires_grad],
                 "weight_decay": self.weight_decay,
@@ -578,226 +514,81 @@ class AdaptiveThresholdTrainer:
             lr=self.learning_rate
         )
     
-    def _parse_confidence_output(self, output_text):
-        """
-        解析LLM输出的置信度分布文本
-        
-        参数:
-            output_text: LLM生成的文本
-            
-        返回:
-            解析后的置信度分布，形状为 [num_classes]
-        """
-        confidence_pattern = r"置信度分布:\s*(高意向:[\d.]+,中意向:[\d.]+,低意向:[\d.]+,无意向:[\d.]+)"
-        class_pattern = r"(高意向|中意向|低意向|无意向):([\d.]+)"
-        
-        # 默认的置信度分布（均匀分布）
-        default_confidence = torch.ones(self.num_classes, device=self.device) / self.num_classes
-        
-        try:
-            # 尝试匹配置信度分布部分
-            import re
-            confidence_match = re.search(confidence_pattern, output_text)
-            
-            if confidence_match:
-                confidence_text = confidence_match.group(1)
-                # 找到所有类别和对应的概率
-                class_matches = re.findall(class_pattern, confidence_text)
-                
-                if len(class_matches) == self.num_classes:
-                    # 用于存储解析后的置信度
-                    confidence = torch.zeros(self.num_classes, device=self.device)
-                    
-                    # 类别到索引的映射，这个需要后续调整
-                    class_to_idx = {
-                        "高意向": 0,
-                        "中意向": 1,
-                        "低意向": 2,
-                        "无意向": 3
-                    }
-                    
-                    # 解析每个类别的概率
-                    for class_name, prob in class_matches:
-                        idx = class_to_idx.get(class_name, -1)
-                        if idx >= 0:
-                            confidence[idx] = float(prob)
-                    
-                    # 归一化
-                    if confidence.sum() > 0:
-                        confidence = confidence / confidence.sum()
-                        return confidence
-            
-            # 如果解析失败，返回默认分布
-            return default_confidence
-            
-        except Exception as e:
-            logger.warning(f"解析置信度分布失败: {e}")
-            return default_confidence
-    
-    def _get_confidence_distribution(self, model_outputs, input_ids):
-        """
-        从模型输出中获取置信度分布
-        
-        参数:
-            model_outputs: 模型输出
-            input_ids: 输入ID
-            
-        返回:
-            置信度分布，形状为 [batch_size, num_classes]
-        """
-        batch_size = input_ids.size(0)
-        confidences = torch.zeros(batch_size, self.num_classes, device=self.device)
-        
-        # 生成完整的文本输出
-        output_ids = model_outputs.logits.argmax(dim=-1)
-        
-        for i in range(batch_size):
-            # 获取生成的文本
-            generated_ids = output_ids[i]
-            generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-            
-            # 解析置信度分布
-            confidence = self._parse_confidence_output(generated_text)
-            confidences[i] = confidence
-        
-        return confidences
-    
-    def _update_thresholds(self, confidence_probs):
-        """
-        更新自适应阈值
-        
-        参数:
-            confidence_probs: 置信度概率分布 [batch_size, num_classes]
-            
-        返回:
-            更新后的每个类别的自适应阈值
-        """
-        batch_size = confidence_probs.size(0)
-        
-        # 1. 计算每个样本的最大预测概率
-        max_probs, pred_classes = torch.max(confidence_probs, dim=1)
-        
-        # 2. 更新全局阈值 τ_s
-        # 使用EMA更新全局阈值
-        mean_confidence = max_probs.mean().item()
-        self.threshold = self.threshold_momentum * self.threshold + (1 - self.threshold_momentum) * mean_confidence
-        
-        # 3. 更新每个类别的局部阈值 p̃_s(k)
-        # 计算每个类别在当前批次中的平均概率 Q_a,b(k)
-        class_batch_probs = torch.zeros(self.num_classes, device=self.device)
-        
-        # 对每个类别，计算批次中所有样本在该类别上的平均概率
-        for k in range(self.num_classes):
-            # 累加该类别的所有概率
-            class_batch_probs[k] = confidence_probs[:, k].mean()
-        
-        # 使用EMA更新类别局部阈值
-        # p̃_s(k) = λp̃_s-1(k) + (1-λ)(1/B_a) * ∑ Q_a,b(k)
-        self.class_probs_ema = (
-            self.class_threshold_momentum * self.class_probs_ema + 
-            (1 - self.class_threshold_momentum) * class_batch_probs
-        )
-        
-        # 4. 根据最大值归一化，生成最终自适应阈值
-        # 找到最大的类别局部阈值
-        max_class_prob = torch.max(self.class_probs_ema)
-        
-        # 根据公式: τ_cs(k) = (p̃_s(k) / max_k' p̃_s(k')) * τ_s
-        if max_class_prob > 0:
-            # 每个类别阈值 = (类别局部阈值/最大局部阈值) * 全局阈值
-            class_thresholds = (self.class_probs_ema / max_class_prob) * self.threshold
-        else:
-            # 如果所有类别概率为0，则使用全局阈值
-            class_thresholds = torch.ones(self.num_classes, device=self.device) * self.threshold
-        
-        return class_thresholds
-    
-    def _generate_pseudo_labels(self, confidence_probs, class_thresholds):
-        """
-        根据置信度概率和自适应阈值生成伪标签
-        
-        参数:
-            confidence_probs: 置信度概率分布 [batch_size, num_classes]
-            class_thresholds: 每个类别的自适应阈值 [num_classes]
-            
-        返回:
-            伪标签和置信度掩码
-        """
-        batch_size = confidence_probs.size(0)
-        
-        # 获取最大概率及其对应的类别
-        max_probs, pseudo_labels = torch.max(confidence_probs, dim=1)
-        
-        # 计算置信度掩码
-        # 对于每个样本，检查其最大概率是否超过对应类别的自适应阈值
-        thresholds = class_thresholds[pseudo_labels]
-        confidence_mask = (max_probs > thresholds)
-        
-        return pseudo_labels, confidence_mask
-    
     def train(
         self, 
-        train_dataset, 
-        val_dataset=None, 
-        batch_size=8, 
+        train_data_path, 
+        val_data_path=None, 
         num_epochs=5, 
         gradient_accumulation_steps=4,
         log_interval=10,
         eval_interval=100,
         save_interval=1000,
         use_wandb=False,
-        lambda_u_max=1.0,  # 无标签损失的最大权重
-        lambda_u_rampup_epochs=1.0  # 无标签损失权重增加的轮数
-       ):
+        augment_segments=True,
+        preprocessed_path=None,
+        max_length=512,
+        system_prompt=None,
+        num_segments=None
+    ):
         """
-        训练模型，实现FixMatch算法的半监督学习
+        训练模型，使用新的音频分段数据加载器
         
         参数:
-            train_dataset: 训练数据集
-            val_dataset: 验证数据集
-            batch_size: 批次大小
+            train_data_path: 训练数据路径
+            val_data_path: 验证数据路径
             num_epochs: 训练轮数
             gradient_accumulation_steps: 梯度累积步数
             log_interval: 日志记录间隔
             eval_interval: 评估间隔
             save_interval: 保存间隔
             use_wandb: 是否使用wandb记录实验
-            lambda_u_max: 无标签损失的最大权重
-            lambda_u_rampup_epochs: 无标签损失权重增加的轮数
+            augment_segments: 是否增强分段
+            preprocessed_path: 预处理数据路径
+            max_length: 最大序列长度
+            system_prompt: 系统提示文本
+            num_segments: 每个音频切分的片段数量，None表示随机
         """
         # 初始化wandb
- 
         if use_wandb:
             wandb.init(
                 project="audio-llm-telemarketing",
                 config={
-                    "model_name": self.model_name,
                     "learning_rate": self.learning_rate,
                     "weight_decay": self.weight_decay,
-                    "lora_r": self.lora_config.r,
-                    "lora_alpha": self.lora_config.lora_alpha,
-                    "lora_dropout": self.lora_config.lora_dropout,
-                    "threshold_init": self.threshold,
-                    "threshold_momentum": self.threshold_momentum,
-                    "confidence_weight": self.confidence_weight,
-                    "batch_size": batch_size,
+                    "segment_loss_weight": self.segment_loss_weight,
                     "num_epochs": num_epochs,
                     "gradient_accumulation_steps": gradient_accumulation_steps,
-                    "lambda_u_max": lambda_u_max,
-                    "lambda_u_rampup_epochs": lambda_u_rampup_epochs,
-                    "algorithm": "FixMatch"
+                    "augment_segments": augment_segments,
+                    "num_segments": num_segments or "random 3-5"
                 }
             )
         
-        # 使用自定义批次获取方法，确保有标签数据均匀分布
-        train_dataset.total_batches = num_epochs * (len(train_dataset) // batch_size)
+        # 创建数据加载器
+        train_loader = create_telemarketing_dataloader(
+            data_path=train_data_path,
+            encoder=AudioEncoder.create_default_encoder(),  # 添加音频编码器
+            labels_file='migrated_labels.csv',              # 使用migrated_labels.csv
+            max_segments=num_segments or 10,                # 使用num_segments或默认值
+            cache_dir='features_cache',                     # 使用特征缓存目录
+            batch_size=8,                                   # 设置批次大小
+            shuffle=True,                                   # 打乱数据顺序
+            system_prompt=system_prompt,                    # 系统提示文本
+            num_workers=0,                                  # 避免多进程问题
+            balance_labels=True                             # 启用标签均衡采样
+        )
         
-        if val_dataset:
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=batch_size,
-                shuffle=False,
-                collate_fn=val_dataset.collate_fn
+        if val_data_path:
+            val_loader = create_telemarketing_dataloader(
+                data_path=val_data_path,
+                encoder=AudioEncoder.create_default_encoder(),  # 添加音频编码器
+                labels_file='migrated_labels.csv',              # 使用migrated_labels.csv
+                max_segments=num_segments or 10,                # 使用num_segments或默认值
+                cache_dir='features_cache',                     # 使用特征缓存目录
+                batch_size=8,                                   # 设置批次大小
+                shuffle=False,                                  # 验证集不打乱顺序
+                system_prompt=system_prompt,                    # 系统提示文本
+                num_workers=0,                                  # 避免多进程问题
+                balance_labels=False                            # 验证集不需要标签均衡采样
             )
         
         # 创建输出目录
@@ -805,138 +596,96 @@ class AdaptiveThresholdTrainer:
         
         # 训练循环
         global_step = 0
-        total_steps = train_dataset.total_batches
+        total_steps = len(train_loader) * num_epochs
         
         for epoch in range(num_epochs):
             self.model.train()
             self.graph_model.train()
             
             epoch_loss = 0
-            labeled_loss = 0
-            unlabeled_loss = 0
-            num_labeled = 0
-            num_unlabeled = 0
-            num_masked = 0  # 记录被掩码（置信度低）的样本数
+            original_loss = 0
+            segment_loss = 0
+            num_batches = 0
             
-            # 计算无标签损失的权重（lambda_u）- 逐渐增加
-            lambda_u = lambda_u_max * min(1.0, epoch / lambda_u_rampup_epochs)
+            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
             
-            num_batches = len(train_dataset) // batch_size
-            progress_bar = tqdm(range(num_batches), desc=f"Epoch {epoch+1}/{num_epochs}")
-            
-            for step in progress_bar:
-                # 获取当前批次数据
-                batch = train_dataset.get_next_batch(batch_size)
+            for step, batch in enumerate(progress_bar):
+                # 每个批次只有一个样本(batch_size=1)
+                num_batches += 1
                 
-                # 将批次数据移动到设备
-                input_ids = batch["input_ids"].to(self.device)
-                attention_mask = batch["attention_mask"].to(self.device)
-                weak_input_ids = batch["weak_input_ids"].to(self.device)
-                weak_attention_mask = batch["weak_attention_mask"].to(self.device)
-                strong_input_ids = batch["strong_input_ids"].to(self.device)
-                strong_attention_mask = batch["strong_attention_mask"].to(self.device)
-                audio_features = batch["audio_features"].to(self.device)
-                weak_audio_features = batch["weak_audio_features"].to(self.device)
-                strong_audio_features = batch["strong_audio_features"].to(self.device)
-                graph_features = batch["graph_features"].to(self.device)
-                speaker_ids = batch["speaker_ids"].to(self.device)
-                labels = batch["labels"].to(self.device)
-                is_labeled = batch["is_labeled"].to(self.device)
-                confidence_input_ids = batch["confidence_input_ids"].to(self.device)
-                confidence_attention_mask = batch["confidence_attention_mask"].to(self.device)
+                # 提取批次数据并移动到设备
+                # 适配新的dataloader返回格式
+                phone_ids = batch['phone_ids']
+                original_features = [feat.to(self.device) for feat in batch['original_features']]
+                segment_features_list = batch['segment_features']
+                labels = batch['labels'].to(self.device)
+                label_onehots = batch['label_onehots'].to(self.device)
+                num_segments = batch['num_segments']
                 
-                # 使用图模型处理图特征
-                graph_embeddings = self.graph_model(graph_features, speaker_ids)
+                # 处理图特征和说话人ID - 使用新格式
+                graph_embeddings = None
+                if "speakers" in batch:
+                    speaker_ids = batch['speakers']
+                    # 这里可以添加图模型处理，如果需要
                 
-                # 计算有标签数据的损失
-                labeled_mask = is_labeled.bool()
+                # 构建适合模型的输入格式
+                # 这里将原始音频特征和片段特征转换为模型期望的格式
                 
-                if labeled_mask.any():
-                    labeled_outputs = self.model(
-                        input_ids=input_ids[labeled_mask],
-                        attention_mask=attention_mask[labeled_mask],
-                        labels=input_ids[labeled_mask]  # 使用输入作为标签进行自回归训练
-                    )
+                # 处理原始音频特征
+                try:
+                    # 构造模型输入 - 可能需要根据模型期望格式调整
+                    original_inputs = {
+                        "input_ids": torch.ones(1, 4).long().to(self.device),  # 占位符
+                        "attention_mask": torch.ones(1, 4).to(self.device),    # 占位符
+                        "labels": labels                                      # 使用dataloader提供的标签
+                    }
                     
-                    current_labeled_loss = labeled_outputs.loss
-                    labeled_loss += current_labeled_loss.item()
-                    num_labeled += labeled_mask.sum().item()
+                    # 如果你的模型需要直接使用特征，添加到inputs中
+                    original_inputs["features"] = original_features[0] if len(original_features) > 0 else None
+                    
+                    original_outputs = self.model(**original_inputs)
+                    orig_loss = original_outputs.loss
+                    original_loss += orig_loss.item()
+                except Exception as e:
+                    logger.error(f"处理原始音频时出错: {e}")
+                    orig_loss = torch.tensor(0.0, device=self.device)
+                
+                # 2. 处理音频片段
+                segments_batch_loss = 0
+                num_valid_segments = 0
+                
+                # 遍历每个样本的所有片段
+                for batch_idx, segments in enumerate(segment_features_list):
+                    for segment_idx, segment_feature in enumerate(segments):
+                        try:
+                            # 将特征移动到设备
+                            segment_feature = segment_feature.to(self.device)
+                            
+                            # 构造片段输入
+                            segment_inputs = {
+                                "input_ids": torch.ones(1, 4).long().to(self.device),  # 占位符
+                                "attention_mask": torch.ones(1, 4).to(self.device),    # 占位符
+                                "labels": labels[batch_idx:batch_idx+1],               # 使用对应样本的标签
+                                "features": segment_feature                           # 片段特征
+                            }
+                            
+                            # 前向传播
+                            segment_outputs = self.model(**segment_inputs)
+                            segments_batch_loss += segment_outputs.loss
+                            num_valid_segments += 1
+                        except Exception as e:
+                            logger.error(f"处理音频片段时出错: {e}")
+                            continue
+                
+                # 计算平均片段损失
+                if num_valid_segments > 0:
+                    avg_segment_loss = segments_batch_loss / num_valid_segments
+                    segment_loss += avg_segment_loss.item()
                 else:
-                    current_labeled_loss = 0
+                    avg_segment_loss = torch.tensor(0.0, device=self.device)
                 
-                # 计算无标签数据的损失（使用FixMatch方法和自适应阈值）
-                unlabeled_mask = ~labeled_mask
-                
-                if unlabeled_mask.any() and lambda_u > 0:
-                    # 1. 使用置信度提示获取每个样本的置信度分布
-                    with torch.no_grad():
-                        confidence_outputs = self.model(
-                            input_ids=confidence_input_ids[unlabeled_mask],
-                            attention_mask=confidence_attention_mask[unlabeled_mask],
-                            output_hidden_states=False
-                        )
-                        
-                        # 解析模型输出，获取置信度分布
-                        confidence_probs = self._get_confidence_distribution(
-                            confidence_outputs, 
-                            confidence_input_ids[unlabeled_mask]
-                        )
-                        
-                        # 更新自适应阈值
-                        class_thresholds = self._update_thresholds(confidence_probs)
-                        
-                        # 生成伪标签和置信度掩码
-                        pseudo_labels, confidence_mask = self._generate_pseudo_labels(
-                            confidence_probs, 
-                            class_thresholds
-                        )
-                    
-                    # 2. 使用强增强数据和伪标签进行训练
-                    strong_outputs = self.model(
-                        input_ids=strong_input_ids[unlabeled_mask],
-                        attention_mask=strong_attention_mask[unlabeled_mask]
-                    )
-                    
-                    strong_logits = strong_outputs.logits
-                    
-                    # 3. 计算无标签损失 - 使用CrossEntropyLoss简化计算
-                    if confidence_mask.sum() > 0:
-                        # 处理模型输出的logits形状以适应CrossEntropyLoss
-                        # 假设强增强模型输出的logits形状为[batch_size, sequence_length, vocab_size]
-                        # 我们需要处理成适合分类任务的形状
-                        
-                        # 使用CrossEntropyLoss计算损失
-                        loss_fn = nn.CrossEntropyLoss(reduction="none")
-                        
-                        # 适配LLM输出，选择适当的token位置计算损失
-                        relevant_logits = strong_logits[:, -1, :]  # 可能需要根据实际情况调整
-                        
-                        # 计算每个样本的损失
-                        individual_losses = loss_fn(relevant_logits, pseudo_labels)
-                        
-                        # 应用置信度掩码
-                        masked_losses = individual_losses * confidence_mask.float()
-                        
-                        # 计算平均损失
-                        current_unlabeled_loss = masked_losses.sum() / confidence_mask.sum()
-                    else:
-                        current_unlabeled_loss = torch.tensor(0.0, device=self.device)
-                    
-                    unlabeled_loss += current_unlabeled_loss.item()
-                    num_unlabeled += unlabeled_mask.sum().item()
-                    num_masked += (~confidence_mask).sum().item()
-                else:
-                    current_unlabeled_loss = 0
-                
-                # 计算总损失 - 使用动态加权
-                if isinstance(current_labeled_loss, torch.Tensor) and isinstance(current_unlabeled_loss, torch.Tensor):
-                    loss = current_labeled_loss + lambda_u * current_unlabeled_loss
-                elif isinstance(current_labeled_loss, torch.Tensor):
-                    loss = current_labeled_loss
-                elif isinstance(current_unlabeled_loss, torch.Tensor):
-                    loss = lambda_u * current_unlabeled_loss
-                else:
-                    loss = torch.tensor(0.0, device=self.device)
+                # 3. 计算总损失 - 加权组合
+                loss = orig_loss + self.segment_loss_weight * avg_segment_loss
                 
                 # 累积梯度
                 loss = loss / gradient_accumulation_steps
@@ -945,7 +694,7 @@ class AdaptiveThresholdTrainer:
                 epoch_loss += loss.item() * gradient_accumulation_steps
                 
                 # 梯度累积
-                if (step + 1) % gradient_accumulation_steps == 0 or (step + 1) == num_batches:
+                if (step + 1) % gradient_accumulation_steps == 0 or (step + 1) == len(train_loader):
                     self.optimizer.step()
                     self.optimizer.zero_grad()
                     
@@ -954,45 +703,22 @@ class AdaptiveThresholdTrainer:
                     # 更新进度条
                     progress_bar.set_postfix({
                         "loss": epoch_loss / (step + 1),
-                        "labeled_loss": labeled_loss / max(num_labeled, 1),
-                        "unlabeled_loss": unlabeled_loss / max(num_unlabeled, 1),
-                        "threshold": self.threshold,
-                        "lambda_u": lambda_u,
-                        "masked_ratio": num_masked / max(num_unlabeled, 1)
+                        "orig_loss": original_loss / num_batches,
+                        "segment_loss": segment_loss / num_batches
                     })
                     
                     # 记录日志
                     if global_step % log_interval == 0 and use_wandb:
-                        # 记录每个类别的自适应阈值
-                        class_threshold_dict = {
-                            f"class_{i}_threshold": self.class_thresholds[i].item() 
-                            for i in range(self.num_classes)
-                        }
-                        
-                        # 记录每个类别的EMA概率
-                        class_prob_dict = {
-                            f"class_{i}_prob_ema": self.class_probs_ema[i].item() 
-                            for i in range(self.num_classes)
-                        }
-                        
-                        # 合并所有要记录的信息
-                        log_dict = {
+                        wandb.log({
                             "loss": epoch_loss / (step + 1),
-                            "labeled_loss": labeled_loss / max(num_labeled, 1),
-                            "unlabeled_loss": unlabeled_loss / max(num_unlabeled, 1),
-                            "global_threshold": self.threshold,
-                            "lambda_u": lambda_u,
-                            "masked_ratio": num_masked / max(num_unlabeled, 1),
+                            "original_loss": original_loss / num_batches,
+                            "segment_loss": segment_loss / num_batches,
                             "global_step": global_step,
                             "progress": global_step / total_steps
-                        }
-                        log_dict.update(class_threshold_dict)
-                        log_dict.update(class_prob_dict)
-                        
-                        wandb.log(log_dict)
+                        })
                     
                     # 评估模型
-                    if val_dataset and global_step % eval_interval == 0:
+                    if val_data_path and global_step % eval_interval == 0:
                         eval_results = self.evaluate(val_loader)
                         
                         logger.info(f"Evaluation at step {global_step}:")
@@ -1011,51 +737,22 @@ class AdaptiveThresholdTrainer:
                         self.save_model(os.path.join(self.output_dir, f"checkpoint-{global_step}"))
             
             # 每个epoch结束后记录日志
-            epoch_avg_loss = epoch_loss / num_batches
-            labeled_avg_loss = labeled_loss / max(num_labeled, 1)
-            unlabeled_avg_loss = unlabeled_loss / max(num_unlabeled, 1)
-            masked_ratio = num_masked / max(num_unlabeled, 1)
+            epoch_avg_loss = epoch_loss / len(train_loader)
+            original_avg_loss = original_loss / num_batches
+            segment_avg_loss = segment_loss / num_batches
             
             logger.info(f"Epoch {epoch+1}/{num_epochs} completed:")
             logger.info(f"  Average loss: {epoch_avg_loss:.4f}")
-            logger.info(f"  Labeled loss: {labeled_avg_loss:.4f}")
-            logger.info(f"  Unlabeled loss: {unlabeled_avg_loss:.4f}")
-            logger.info(f"  Global threshold: {self.threshold:.4f}")
-            logger.info(f"  Lambda_u: {lambda_u:.4f}")
-            logger.info(f"  Masked ratio: {masked_ratio:.4f}")
-            
-            # 记录每个类别的自适应阈值
-            logger.info("  类别自适应阈值:")
-            for i in range(self.num_classes):
-                logger.info(f"    类别 {i}: {self.class_thresholds[i].item():.4f}")
+            logger.info(f"  Original loss: {original_avg_loss:.4f}")
+            logger.info(f"  Segment loss: {segment_avg_loss:.4f}")
             
             if use_wandb:
-                # 记录每个类别的自适应阈值
-                class_threshold_dict = {
-                    f"epoch_class_{i}_threshold": self.class_thresholds[i].item() 
-                    for i in range(self.num_classes)
-                }
-                
-                # 记录每个类别的EMA概率
-                class_prob_dict = {
-                    f"epoch_class_{i}_prob_ema": self.class_probs_ema[i].item() 
-                    for i in range(self.num_classes)
-                }
-                
-                # 合并所有要记录的信息
-                log_dict = {
+                wandb.log({
                     "epoch": epoch + 1,
                     "epoch_loss": epoch_avg_loss,
-                    "epoch_labeled_loss": labeled_avg_loss,
-                    "epoch_unlabeled_loss": unlabeled_avg_loss,
-                    "epoch_global_threshold": self.threshold,
-                    "epoch_lambda_u": lambda_u,
-                    "epoch_masked_ratio": masked_ratio
-                }
-                log_dict.update(class_threshold_dict)
-                log_dict.update(class_prob_dict)
-                
-                wandb.log(log_dict)
+                    "epoch_original_loss": original_avg_loss,
+                    "epoch_segment_loss": segment_avg_loss
+                })
             
             # 保存每个epoch的模型
             self.save_model(os.path.join(self.output_dir, f"epoch-{epoch+1}"))
@@ -1065,7 +762,6 @@ class AdaptiveThresholdTrainer:
         
         if use_wandb:
             wandb.finish()
-    
     
     def evaluate(self, val_loader):
         """
@@ -1081,56 +777,77 @@ class AdaptiveThresholdTrainer:
         self.graph_model.eval()
         
         val_loss = 0
+        num_batches = 0
         all_preds = []
         all_labels = []
         
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Evaluating"):
-                # 将批次数据移动到设备
-                input_ids = batch["input_ids"].to(self.device)
-                attention_mask = batch["attention_mask"].to(self.device)
-                audio_features = batch["audio_features"].to(self.device)
-                graph_features = batch["graph_features"].to(self.device)
-                speaker_ids = batch["speaker_ids"].to(self.device)
-                labels = batch["labels"].to(self.device)
+                num_batches += 1
                 
-                # 使用图模型处理图特征
-                graph_embeddings = self.graph_model(graph_features, speaker_ids)
+                # 提取批次数据并移动到设备 - 适配新的dataloader格式
+                phone_ids = batch['phone_ids']
+                original_features = [feat.to(self.device) for feat in batch['original_features']]
+                labels = batch['labels'].to(self.device)
+                label_onehots = batch['label_onehots'].to(self.device)
                 
                 # 前向传播
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=input_ids  # 使用输入作为标签进行自回归训练
-                )
-                
-                val_loss += outputs.loss.item()
-                
-                # 获取预测结果
-                # 注意：在实际项目中，这里应该根据实际任务进行预测提取
-                logits = outputs.logits
-                preds = torch.argmax(logits, dim=-1)
-                
-                # 收集预测和标签
-                all_preds.extend(preds.cpu().numpy().tolist())
-                all_labels.extend(labels.cpu().numpy().tolist())
+                try:
+                    # 构造模型输入
+                    inputs = {
+                        "input_ids": torch.ones(len(labels), 4).long().to(self.device),  # 占位符
+                        "attention_mask": torch.ones(len(labels), 4).to(self.device),    # 占位符
+                        "labels": labels
+                    }
+                    
+                    # 如果模型需要直接使用特征，添加到inputs中
+                    for i, feat in enumerate(original_features):
+                        if i == 0:  # 只处理第一个样本，用于示例
+                            inputs["features"] = feat
+                    
+                    outputs = self.model(**inputs)
+                    loss = outputs.loss
+                    val_loss += loss.item()
+                    
+                    # 如果模型输出包含logits，则获取预测结果
+                    if hasattr(outputs, 'logits'):
+                        logits = outputs.logits
+                        preds = torch.argmax(logits, dim=-1)
+                        all_preds.extend(preds.cpu().numpy())
+                        all_labels.extend(labels.cpu().numpy())
+                except Exception as e:
+                    logger.error(f"评估时处理批次出错: {e}")
+                    continue
+        
+        # 计算平均损失
+        avg_loss = val_loss / max(num_batches, 1)
         
         # 计算评估指标
-        # 注意：在实际项目中，这里应该根据实际任务计算适当的指标
-        accuracy = accuracy_score(all_labels, all_preds)
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            all_labels, all_preds, average="weighted"
-        )
-        
-        avg_loss = val_loss / len(val_loader)
-        
-        return {
+        results = {
             "eval_loss": avg_loss,
-            "eval_accuracy": accuracy,
-            "eval_precision": precision,
-            "eval_recall": recall,
-            "eval_f1": f1
         }
+        
+        # 如果有预测结果，计算准确率
+        if all_preds and all_labels and len(all_preds) == len(all_labels):
+            # 过滤掉无效标签(-1)
+            valid_indices = [i for i, label in enumerate(all_labels) if label != -1]
+            if valid_indices:
+                valid_preds = [all_preds[i] for i in valid_indices]
+                valid_labels = [all_labels[i] for i in valid_indices]
+                
+                accuracy = accuracy_score(valid_labels, valid_preds)
+                precision, recall, f1, _ = precision_recall_fscore_support(
+                    valid_labels, valid_preds, average='weighted'
+                )
+                
+                results.update({
+                    "accuracy": accuracy,
+                    "precision": precision,
+                    "recall": recall,
+                    "f1": f1
+                })
+        
+        return results
     
     def save_model(self, output_path):
         """
@@ -1142,11 +859,11 @@ class AdaptiveThresholdTrainer:
         # 创建输出目录
         os.makedirs(output_path, exist_ok=True)
         
-        # 保存LoRA模型
+        # 保存模型
         self.model.save_pretrained(output_path)
         
-        # 保存分词器
-        self.tokenizer.save_pretrained(output_path)
+        # 保存处理器
+        self.processor.save_pretrained(output_path)
         
         # 保存图模型
         torch.save(self.graph_model.state_dict(), os.path.join(output_path, "graph_model.pt"))
@@ -1155,12 +872,9 @@ class AdaptiveThresholdTrainer:
         with open(os.path.join(output_path, "trainer_config.json"), "w") as f:
             import json
             json.dump({
-                "model_name": self.model_name,
                 "learning_rate": self.learning_rate,
                 "weight_decay": self.weight_decay,
-                "threshold": self.threshold,
-                "threshold_momentum": self.threshold_momentum,
-                "confidence_weight": self.confidence_weight
+                "segment_loss_weight": self.segment_loss_weight
             }, f)
         
         logger.info(f"模型保存到: {output_path}")
@@ -1172,142 +886,98 @@ class AdaptiveThresholdTrainer:
         参数:
             model_path: 模型路径
         """
-        # 加载LoRA模型
-        self.model = AutoModelForCausalLM.from_pretrained(model_path)
-        
-        # 加载分词器
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        
         # 加载图模型
         self.graph_model.load_state_dict(torch.load(os.path.join(model_path, "graph_model.pt")))
         
         logger.info(f"模型从 {model_path} 加载成功")
 
 
-# 更新main函数以使用新的训练方法和预处理的增强数据
-def main(use_preprocessed=True):
-    """
-    主函数
+def main():
+    """主函数"""
+    # 添加路径
+    sys.path.append('/data/shared/Qwen/ECAI')
+    from qwen2_5_omni_light import Qwen25OmniLightProcessor, Qwen2_5OmniTextOnlyModel
+    import torch
+    from qwen_omni_utils import process_mm_info
     
-    参数:
-        use_preprocessed: 是否使用预处理好的数据
-    """
     # 配置参数
-    model_name = "THUDM/chatglm3-6b"  # LLM路径
+    model_path = "/data/shared/Qwen/models/Qwen2.5-Omni-7B"
+    
+    # 加载processor
+    processor = Qwen25OmniLightProcessor.from_pretrained(model_path)
+    
+    # 加载模型
+    model = Qwen2_5OmniTextOnlyModel.from_pretrained(
+        model_path, 
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        attn_implementation="flash_attention_2"
+    )
+    
+    # 更新图模型配置
     graph_config = {
-        "input_dim": 768,  # 根据您的特征维度调整
-        "hidden_dim": 256,
-        "output_dim": 128,
-        "num_heads": 4,
-        "speaker_embedding_dim": 64,
-        "num_layers": 2,
-        "dropout": 0.2,
-        "similarity_threshold": 0.5,
-        "context_window_size": 4
+        "token_embedding_dim": 768,  # 输入token嵌入维度
+        "hidden_dim": 256,          # 隐藏层维度
+        "output_dim": 128,          # 输出维度
+        "num_heads": 4,             # 注意力头数量
+        "speaker_embedding_dim": 64, # 说话者嵌入维度
+        "num_speakers": None,       # 动态说话者嵌入
+        "num_layers": 2,            # GAT层数
+        "dropout": 0.2,             # Dropout概率
+        "similarity_threshold": 0.5,# 相似度阈值
+        "context_window_size": 4,   # 上下文窗口大小
+        "aggregation_method": "mean"# 特征聚合方法
     }
+    
     output_dir = "./outputs"
     
     # 数据路径
     train_data_path = "./data/train"
     val_data_path = "./data/val"
-    augmented_data_path = "./data/augmented"
+    preprocessed_path = "./data/segments"
     
     # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(augmented_data_path, exist_ok=True)
-    
-    # 根据use_preprocessed参数决定是否预处理数据
-    if use_preprocessed:
-        # 检查是否已经存在预处理好的数据
-        fixmatch_data_path = os.path.join(augmented_data_path, "fixmatch_paired_data.pt")
-        if not os.path.exists(fixmatch_data_path):
-            logger.info("未找到预处理好的数据，开始预处理...")
-            
-            # 导入预处理脚本
-            try:
-                import sys
-                sys.path.append(".")
-                from preprocess_data import preprocess_unlabeled_data
-                
-                # 执行预处理
-                unlabeled_data_path = os.path.join(train_data_path, "unlabeled_data.pt")
-                success = preprocess_unlabeled_data(
-                    unlabeled_data_path,
-                    augmented_data_path,
-                    weak_augment=True,
-                    strong_augment=True,
-                    num_weak_augmentations=1,
-                    num_strong_augmentations=1,
-                    seed=42
-                )
-                
-                if success:
-                    logger.info("数据预处理完成，将使用预处理好的数据进行训练")
-                else:
-                    logger.warning("数据预处理失败，回退到动态生成数据进行训练")
-                    use_preprocessed = False
-            except ImportError:
-                logger.warning("找不到预处理脚本，回退到动态生成数据进行训练")
-                use_preprocessed = False
-            except Exception as e:
-                logger.warning(f"预处理数据时出错: {e}")
-                logger.warning("回退到动态生成数据进行训练")
-                use_preprocessed = False
-        else:
-            logger.info(f"发现预处理好的数据: {fixmatch_data_path}")
+    os.makedirs(preprocessed_path, exist_ok=True)
     
     # 初始化训练器
     trainer = AdaptiveThresholdTrainer(
-        model_name=model_name,
+        model=model,
+        processor=processor,
         graph_config=graph_config,
         output_dir=output_dir,
         learning_rate=2e-5,
-        lora_r=16,
-        lora_alpha=32,
-        threshold_init=0.7,
-        num_classes=4,
-        class_threshold_momentum=0.9
+        segment_loss_weight=0.5,  # 片段损失权重
+        num_classes=4
     )
     
-    # 初始化分词器
-    tokenizer = trainer.tokenizer
-    
-    # 加载数据集
-    train_dataset = AudioDialogueDataset(
-        data_path=train_data_path,
-        tokenizer=tokenizer,
-        labeled_ratio=0.1,  # 10%有标签数据
-        use_preprocessed=use_preprocessed,
-        preprocessed_path=augmented_data_path
-    )
-    
-    val_dataset = AudioDialogueDataset(
-        data_path=val_data_path,
-        tokenizer=tokenizer,
-        labeled_ratio=1.0,  # 验证集全部有标签
-        use_preprocessed=False  # 验证集通常不需要增强
-    )
+    # 系统提示文本
+    system_prompt = "You are a helpful assistant specialized in analyzing customer conversations."
     
     # 训练模型
     trainer.train(
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        batch_size=4,
+        train_data_path=train_data_path,
+        val_data_path=val_data_path,
         num_epochs=3,
         gradient_accumulation_steps=4,
-        lambda_u_max=1.0,  # 无标签损失的最大权重
-        lambda_u_rampup_epochs=1.0,  # 无标签损失权重增加的轮数
+        preprocessed_path=preprocessed_path,
+        augment_segments=True,
+        system_prompt=system_prompt,
         use_wandb=True
     )
-
 
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='训练脚本')
-    parser.add_argument('--use-preprocessed', action='store_true', default=True,
-                        help='是否使用预处理好的数据')
+    parser.add_argument('--augment-segments', action='store_true', default=True,
+                        help='是否对音频分段进行增强')
+    parser.add_argument('--num-segments', type=int, default=None,
+                        help='每个音频切分的片段数量，None表示随机')
+    parser.add_argument('--system-prompt', type=str, 
+                        default="You are a helpful assistant specialized in analyzing customer conversations.",
+                        help='系统提示文本')
     
     args = parser.parse_args()
     
-    main(use_preprocessed=args.use_preprocessed)
+    main()
