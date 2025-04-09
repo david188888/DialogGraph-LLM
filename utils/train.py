@@ -17,7 +17,7 @@ import sys
 
 from utils.graph import DialogueGraphModel
 from utils.audio_augment import AudioAugmenter
-from utils.dataloader import create_telemarketing_dataloader
+from utils.dataloader import AudioSegmentDataset, LabelBalancedSampler, DataLoaderConfig
 from utils.model import AudioEncoder
 
 # 设置日志
@@ -528,7 +528,9 @@ class AdaptiveThresholdTrainer:
         preprocessed_path=None,
         max_length=512,
         system_prompt=None,
-        num_segments=None
+        num_segments=None,
+        batch_size=8,
+        use_balanced_sampling=True
     ):
         """
         训练模型，使用新的音频分段数据加载器
@@ -547,6 +549,8 @@ class AdaptiveThresholdTrainer:
             max_length: 最大序列长度
             system_prompt: 系统提示文本
             num_segments: 每个音频切分的片段数量，None表示随机
+            batch_size: 批次大小
+            use_balanced_sampling: 是否使用平衡采样
         """
         # 初始化wandb
         if use_wandb:
@@ -563,32 +567,84 @@ class AdaptiveThresholdTrainer:
                 }
             )
         
-        # 创建数据加载器
-        train_loader = create_telemarketing_dataloader(
+        # 1. 创建配置实例
+        train_config = DataLoaderConfig(
             data_path=train_data_path,
-            encoder=AudioEncoder.create_default_encoder(),  # 添加音频编码器
-            labels_file='migrated_labels.csv',              # 使用migrated_labels.csv
-            max_segments=num_segments or 10,                # 使用num_segments或默认值
-            cache_dir='features_cache',                     # 使用特征缓存目录
-            batch_size=8,                                   # 设置批次大小
-            shuffle=True,                                   # 打乱数据顺序
-            system_prompt=system_prompt,                    # 系统提示文本
-            num_workers=0,                                  # 避免多进程问题
-            balance_labels=True                             # 启用标签均衡采样
+            labels_file='migrated_labels.csv',
+            max_segments=num_segments or 10, # 使用传入的num_segments或默认值
+            cache_dir='features_cache',
+            batch_size=batch_size, # 使用传入的batch_size
+            shuffle=not use_balanced_sampling, # 如果使用平衡采样，shuffle为False
+            num_workers=0, # 避免多进程问题
+            system_prompt=system_prompt,
+            balance_labels=use_balanced_sampling,
+            # front_dense_ratio 和 dense_factor 使用默认值
+        )
+
+        # 2. 创建 Dataset 实例
+        # 注意：feature_extractor 和 encoder 需要在这里创建或获取
+        # 这里假设我们创建一个默认的 encoder
+        audio_encoder = AudioEncoder.create_default_encoder()
+        train_dataset = AudioSegmentDataset(
+            data_path=train_config.data_path,
+            encoder=audio_encoder,
+            labels_file=train_config.labels_file,
+            max_segments=train_config.max_segments,
+            cache_dir=train_config.cache_dir,
+            system_prompt=train_config.system_prompt
+        )
+
+        # 3. 创建 DataLoader
+        train_sampler = None
+        if train_config.balance_labels:
+            train_sampler = LabelBalancedSampler(
+                dataset=train_dataset,
+                batch_size=train_config.batch_size,
+                front_dense_ratio=train_config.front_dense_ratio,
+                dense_factor=train_config.dense_factor
+            )
+            train_config.shuffle = False # 使用 sampler 时 shuffle 必须为 False
+            print(f"已启用标签均衡采样，前{int(len(train_dataset) * train_config.front_dense_ratio)}个样本中有标签样本密度为标准的{train_config.dense_factor}倍")
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=train_config.batch_size,
+            sampler=train_sampler,
+            shuffle=train_config.shuffle,
+            collate_fn=train_dataset.collate_fn,
+            num_workers=train_config.num_workers
         )
         
+        val_loader = None
         if val_data_path:
-            val_loader = create_telemarketing_dataloader(
+            # 创建验证集配置 (通常不需要平衡采样)
+            val_config = DataLoaderConfig(
                 data_path=val_data_path,
-                encoder=AudioEncoder.create_default_encoder(),  # 添加音频编码器
-                labels_file='migrated_labels.csv',              # 使用migrated_labels.csv
-                max_segments=num_segments or 10,                # 使用num_segments或默认值
-                cache_dir='features_cache',                     # 使用特征缓存目录
-                batch_size=8,                                   # 设置批次大小
-                shuffle=False,                                  # 验证集不打乱顺序
-                system_prompt=system_prompt,                    # 系统提示文本
-                num_workers=0,                                  # 避免多进程问题
-                balance_labels=False                            # 验证集不需要标签均衡采样
+                labels_file='migrated_labels.csv',
+                max_segments=num_segments or 10,
+                cache_dir='features_cache',
+                batch_size=batch_size, # 使用相同的 batch_size
+                shuffle=False, # 验证集不打乱
+                num_workers=0,
+                system_prompt=system_prompt,
+                balance_labels=False # 验证集不使用平衡采样
+            )
+            # 创建验证集 Dataset
+            val_dataset = AudioSegmentDataset(
+                data_path=val_config.data_path,
+                encoder=audio_encoder, # 使用相同的 encoder
+                labels_file=val_config.labels_file,
+                max_segments=val_config.max_segments,
+                cache_dir=val_config.cache_dir,
+                system_prompt=val_config.system_prompt
+            )
+            # 创建验证集 DataLoader
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=val_config.batch_size,
+                shuffle=val_config.shuffle,
+                collate_fn=val_dataset.collate_fn,
+                num_workers=val_config.num_workers
             )
         
         # 创建输出目录

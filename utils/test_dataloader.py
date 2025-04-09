@@ -8,8 +8,9 @@ from torch.utils.data import DataLoader
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# 导入dataloader
-from utils.dataloader import AudioEncoder, AudioFeatureExtractor, create_telemarketing_dataloader
+# 导入需要的类
+from utils.model import AudioEncoder, AudioFeatureExtractor
+from utils.dataloader import DataLoaderConfig, AudioSegmentDataset, LabelBalancedSampler
 
 # 设置日志级别，减少输出
 logging.basicConfig(
@@ -43,8 +44,7 @@ def print_batch_info(batch, batch_idx):
         
         # 打印分段特征形状
         logger.info("\n分段音频特征形状:")
-        for i, segments in enumerate(batch['segment_features']):
-            logger.info(f"  样本{i}: {len(segments)}个片段, 第一个片段形状: {segments[0].shape}")
+
     else:  # 其他批次只显示标签
         info_str = f"批次 {batch_idx} - 数值标签: {batch['labels'].tolist()}"
         if 'original_labels' in batch:
@@ -64,15 +64,33 @@ def test_standard_dataloader():
     os.makedirs(cache_dir, exist_ok=True)
     
     logger.info("测试标准数据加载器 (不使用标签均衡)...")
-    dataloader = create_telemarketing_dataloader(
+
+    # 1. 创建配置
+    config = DataLoaderConfig(
         data_path=data_dir,
-        feature_extractor=feature_extractor,
-        encoder=encoder,
         labels_file='migrated_labels.csv',
         cache_dir=cache_dir,
-        batch_size=1,
+        batch_size=1, # 测试时常用 batch_size=1
         shuffle=True,
-        num_workers=0
+        num_workers=0,
+        balance_labels=False # 标准加载器不使用均衡
+    )
+
+    # 2. 创建数据集
+    dataset = AudioSegmentDataset(
+        data_path=config.data_path,
+        encoder=encoder, # 将 encoder 传递给数据集
+        labels_file=config.labels_file,
+        cache_dir=config.cache_dir
+    )
+
+    # 3. 创建 DataLoader
+    dataloader = DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=config.shuffle,
+        num_workers=config.num_workers,
+        collate_fn=dataset.collate_fn
     )
     
     # 分析前5个批次的标签分布
@@ -106,17 +124,45 @@ def test_balanced_dataloader():
     os.makedirs(cache_dir, exist_ok=True)
     
     logger.info("\n测试标签均衡数据加载器...")
-    dataloader = create_telemarketing_dataloader(
+
+    # 1. 创建配置
+    config = DataLoaderConfig(
         data_path=data_dir,
-        feature_extractor=feature_extractor,
-        encoder=encoder,
         labels_file='migrated_labels.csv',
         cache_dir=cache_dir,
         batch_size=1,
-        balance_labels=True,  # 启用标签均衡
+        shuffle=False, # 使用 sampler 时 shuffle 必须为 False
+        num_workers=0,
+        balance_labels=True, # 启用标签均衡
         front_dense_ratio=0.6,
-        dense_factor=2.0,
-        num_workers=0
+        dense_factor=2.0
+    )
+
+    # 2. 创建数据集
+    dataset = AudioSegmentDataset(
+        data_path=config.data_path,
+        encoder=encoder,
+        labels_file=config.labels_file,
+        cache_dir=config.cache_dir
+    )
+
+    # 3. 创建 Sampler
+    sampler = LabelBalancedSampler(
+        dataset=dataset,
+        batch_size=config.batch_size,
+        front_dense_ratio=config.front_dense_ratio,
+        dense_factor=config.dense_factor
+    )
+    print(f"标签均衡采样器已创建。")
+
+    # 4. 创建 DataLoader
+    dataloader = DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        sampler=sampler,
+        shuffle=False, # sampler 和 shuffle 互斥
+        num_workers=config.num_workers,
+        collate_fn=dataset.collate_fn
     )
     
     # 分析前5个批次的标签分布
@@ -163,7 +209,13 @@ def test_balanced_dataloader():
         early_density = labeled_count / total_count
         late_density = labeled_count_late / total_count_late
         logger.info(f"\n标签密度对比 - 前5个批次: {early_density:.2%}, 后5个批次: {late_density:.2%}")
-        logger.info(f"密度比例: 前/后 = {early_density/late_density if late_density else 'N/A':.2f}")
+        
+        # 避免除零错误的正确方式
+        if late_density > 0:
+            ratio = early_density / late_density
+            logger.info(f"密度比例: 前/后 = {ratio:.2f}")
+        else:
+            logger.info(f"密度比例: 前/后 = 无法计算 (后5个批次无有标签样本)")
     
     return dataloader
 
@@ -171,7 +223,7 @@ if __name__ == "__main__":
     logger.info("开始测试dataloader...")
     
     # 测试标准数据加载器
-    standard_loader = test_standard_dataloader()
+    # standard_loader = test_standard_dataloader()
     
     # 测试标签均衡数据加载器
     balanced_loader = test_balanced_dataloader()

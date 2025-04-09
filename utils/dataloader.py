@@ -11,11 +11,29 @@ import tqdm
 import logging
 import torch.nn as nn
 from utils.model import AudioEncoder, AudioFeatureExtractor
+import dataclasses
+from typing import Optional
+
+# 新增 DataLoader 配置类
+@dataclasses.dataclass
+class DataLoaderConfig:
+    """DataLoader 配置"""
+    data_path: str
+    labels_file: str = 'migrated_labels.csv' # 默认使用迁移后的标签
+    cache_dir: str = 'features_cache'
+    batch_size: int = 8 # 提供一个默认批次大小
+    shuffle: bool = True
+    num_workers: int = 0
+    system_prompt: Optional[str] = None
+    balance_labels: bool = False # 默认不使用标签均衡
+    front_dense_ratio: float = 0.6
+    dense_factor: float = 2.0
+    # 注意：feature_extractor 和 encoder 通常在外部创建并传入Dataset，
+    # 这里不直接包含在配置中，以保持配置类的简洁性。
 
 class AudioSegmentDataset(Dataset):
     
-    def __init__(self, data_path, feature_extractor=None, encoder=None, labels_file='migrated_labels.csv',
-                 max_segments=10, cache_dir='features_cache', system_prompt=None):
+    def __init__(self, data_path, feature_extractor=None, encoder=None, labels_file='migrated_labels.csv', cache_dir='./features_cache', system_prompt=None):
         """
         初始化音频分段数据集
         
@@ -24,7 +42,6 @@ class AudioSegmentDataset(Dataset):
             feature_extractor: 音频特征提取器实例，如果None则创建默认提取器
             encoder: 音频编码器，用于进一步处理特征
             labels_file: 标签文件名称
-            max_segments: 每个对话最多使用的片段数量
             cache_dir: 特征缓存目录
             system_prompt: 系统提示文本
         """
@@ -32,7 +49,6 @@ class AudioSegmentDataset(Dataset):
         self.segments_dir = os.path.join(data_path, 'segments')
         self.audio_dir = os.path.join(data_path, 'audio')
         self.labels_file = os.path.join(data_path, labels_file)
-        self.max_segments = max_segments
         self.cache_dir = os.path.join(data_path, cache_dir) if cache_dir else None
         self.system_prompt = system_prompt
         
@@ -176,9 +192,7 @@ class AudioSegmentDataset(Dataset):
             
             total_segments = sum(item['num_segments'] for item in self.data)
             avg_segments = total_segments / len(self.data) if self.data else 0
-            max_segments = max(item['num_segments'] for item in self.data) if self.data else 0
             print(f"加载了 {len(self.data)} 个电话对话，总共 {total_segments} 个片段")
-            print(f"平均每个对话 {avg_segments:.2f} 个片段，最多 {max_segments} 个片段")
             print("注意：因为保留了所有片段，建议使用batch_size=1以避免内存问题")
             
             # 统计各类标签数量
@@ -205,7 +219,8 @@ class AudioSegmentDataset(Dataset):
     
     def _get_audio_segments(self, item):
         """
-        获取音频片段的特征和原始音频的特征，使用两个总的pt文件分别存储
+        获取音频片段的特征和原始音频的特征。
+        使用按文件缓存策略，每个音频或片段对应一个缓存文件。
         
         参数:
             item: 数据项，包含原始音频和片段音频的路径
@@ -217,86 +232,83 @@ class AudioSegmentDataset(Dataset):
         original_audio_file = item['original_audio_file']
         segment_files = item['segment_files']
         
-        # 定义两个总的缓存文件路径
-        if self.cache_dir is not None:
-            os.makedirs(self.cache_dir, exist_ok=True)
-            original_features_cache = os.path.join(self.cache_dir, "original_features.pt")
-            segment_features_cache = os.path.join(self.cache_dir, "segment_features.pt")
-        else:
-            original_features_cache = None
-            segment_features_cache = None
-        
-        # --- 处理原始音频特征 ---
+        # --- 处理原始音频特征 --- 
         original_features = None
-        
-        # 尝试从总缓存加载原始音频特征
-        if original_features_cache and os.path.exists(original_features_cache):
-            try:
-                features_dict = torch.load(original_features_cache)
-                # 检查当前phone_id是否在缓存中
-                if phone_id in features_dict:
-                    original_features = features_dict[phone_id]['features']
-            except Exception as e:
-                print(f"加载原始音频特征缓存失败: {str(e)}")
-        else:
-            # 如果缓存文件不存在，创建一个空字典
-            features_dict = {}
-        
-        # 如果缓存中没有当前phone_id的特征，则提取特征
+        original_cache_path = None
+        if self.cache_dir:
+            # 定义原始音频特征的缓存子目录和文件路径
+            original_cache_subdir = os.path.join(self.cache_dir, "original_features")
+            os.makedirs(original_cache_subdir, exist_ok=True)
+            original_cache_path = os.path.join(original_cache_subdir, f"{phone_id}.pt")
+            
+            # 尝试从单个缓存文件加载
+            if os.path.exists(original_cache_path):
+                try:
+                    original_features = torch.load(original_cache_path)
+                    # print(f"原始特征缓存命中: {original_cache_path}") # 用于调试
+                except Exception as e:
+                    print(f"加载原始特征缓存失败 {original_cache_path}: {str(e)}")
+                    original_features = None # 确保加载失败时重新提取
+
+        # 如果缓存中没有或加载失败，则提取特征
         if original_features is None:
+            # print(f"原始特征缓存未命中或加载失败: {original_audio_file}") # 用于调试
             original_features = self.feature_extractor.extract_features(original_audio_file)
             
-            # 将新提取的特征添加到字典中
-            if original_features_cache:
-                features_dict[phone_id] = {
-                    'phone_id': phone_id,
-                    'audio_path': original_audio_file,
-                    'features': original_features,
-                    'extraction_time': torch.tensor(pd.Timestamp.now().timestamp())
-                }
-                # 保存更新后的字典
-                torch.save(features_dict, original_features_cache)
+            # 如果启用了缓存，保存到对应的单个文件
+            if original_cache_path:
+                try:
+                    torch.save(original_features, original_cache_path)
+                    # print(f"原始特征缓存已保存: {original_cache_path}") # 用于调试
+                except Exception as e:
+                    print(f"保存原始特征缓存失败 {original_cache_path}: {str(e)}")
         
-        # --- 处理分段音频特征 ---
+        # --- 处理分段音频特征 --- 
         segment_features = []
-        
-        # 尝试从总缓存加载分段音频特征
-        segment_dict = {}
-        if segment_features_cache and os.path.exists(segment_features_cache):
-            try:
-                segment_dict = torch.load(segment_features_cache)
-            except Exception as e:
-                print(f"加载分段音频特征缓存失败: {str(e)}")
+        segment_cache_subdir = None
+        if self.cache_dir:
+            # 定义分段音频特征的缓存子目录
+            segment_cache_subdir = os.path.join(self.cache_dir, "segment_features")
+            os.makedirs(segment_cache_subdir, exist_ok=True)
         
         # 处理每个分段音频
         for i, segment_file in enumerate(segment_files):
             segment_name = os.path.basename(segment_file).split('.')[0]  # 不包含扩展名
-            
-            # 检查当前分段是否在缓存中
             segment_feature = None
-            if segment_name in segment_dict:
-                segment_feature = segment_dict[segment_name]['features']
+            segment_cache_path = None
             
-            # 如果缓存中没有当前分段的特征，则提取特征
+            if segment_cache_subdir:
+                segment_cache_path = os.path.join(segment_cache_subdir, f"{segment_name}.pt")
+                
+                # 尝试从单个缓存文件加载
+                if os.path.exists(segment_cache_path):
+                    try:
+                        segment_feature = torch.load(segment_cache_path)
+                        # print(f"片段特征缓存命中: {segment_cache_path}") # 用于调试
+                    except Exception as e:
+                        print(f"加载片段特征缓存失败 {segment_cache_path}: {str(e)}")
+                        segment_feature = None # 确保加载失败时重新提取
+            
+            # 如果缓存中没有或加载失败，则提取特征
             if segment_feature is None:
+                # print(f"片段特征缓存未命中或加载失败: {segment_file}") # 用于调试
                 segment_feature = self.feature_extractor.extract_features(segment_file)
                 
-                # 将新提取的特征添加到字典中
-                if segment_features_cache:
-                    segment_dict[segment_name] = {
-                        'phone_id': phone_id,
-                        'segment_id': i,
-                        'segment_name': segment_name,
-                        'audio_path': segment_file,
-                        'features': segment_feature,
-                        'extraction_time': torch.tensor(pd.Timestamp.now().timestamp())
-                    }
+                # 如果启用了缓存，保存到对应的单个文件
+                if segment_cache_path:
+                    try:
+                        torch.save(segment_feature, segment_cache_path)
+                        # print(f"片段特征缓存已保存: {segment_cache_path}") # 用于调试
+                    except Exception as e:
+                        print(f"保存片段特征缓存失败 {segment_cache_path}: {str(e)}")
             
-            segment_features.append(segment_feature)
-        
-        # 保存更新后的分段特征字典
-        if segment_features_cache:
-            torch.save(segment_dict, segment_features_cache)
+            # 收集特征 (确保即使保存失败也能添加到列表中)
+            if segment_feature is not None:
+                 segment_features.append(segment_feature)
+            else:
+                 print(f"警告：无法提取或加载片段特征: {segment_file}")
+
+        # 注意：现在不需要在处理完所有片段后保存全局字典了
         
         return original_features, segment_features
     
@@ -427,85 +439,6 @@ class AudioSegmentDataset(Dataset):
         }
         
         return batch_dict
-
-def create_telemarketing_dataloader(
-    data_path,
-    feature_extractor=None,
-    encoder=None,
-    labels_file='labels.csv',
-    max_segments=10,
-    cache_dir='features_cache',
-    batch_size=4,
-    shuffle=True,
-    num_workers=0,
-    system_prompt=None,
-    balance_labels=False,  # 新增参数：是否使用标签均衡采样
-    front_dense_ratio=0.6,  # 新增参数：前面部分所占比例
-    dense_factor=2.0  # 新增参数：前面部分有标签样本的密度倍数
-):
-    """
-    创建电话营销音频数据加载器，用于加载已切分的音频片段
-    
-    参数:
-        data_path: 数据根目录路径
-        feature_extractor: 音频特征提取器，如果None则创建默认提取器
-        encoder: 音频编码器，用于进一步处理特征
-        labels_file: 标签文件名称
-        max_segments: 每个对话最多使用的片段数量
-        cache_dir: 特征缓存目录
-        batch_size: 批次大小
-        shuffle: 是否打乱数据顺序
-        num_workers: 数据加载的工作线程数量
-        system_prompt: 系统提示文本
-        balance_labels: 是否使用标签均衡采样，使有标签样本均匀分布
-        front_dense_ratio: 前面部分所占总体数据的比例
-        dense_factor: 前面部分有标签样本的密度倍数
-        
-    返回:
-        数据加载器
-    """
-    dataset = AudioSegmentDataset(
-        data_path=data_path,
-        feature_extractor=feature_extractor,
-        encoder=encoder,
-        labels_file=labels_file,
-        max_segments=max_segments,
-        cache_dir=cache_dir,
-        system_prompt=system_prompt
-    )
-    
-    # 判断是否使用标签均衡采样
-    if balance_labels:
-        # 使用LabelBalancedSampler
-        sampler = LabelBalancedSampler(
-            dataset=dataset,
-            batch_size=batch_size,
-            front_dense_ratio=front_dense_ratio,
-            dense_factor=dense_factor
-        )
-        
-        # 使用自定义采样器时，shuffle参数必须为False
-        dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            sampler=sampler,  # 使用自定义采样器
-            shuffle=False,     # 使用采样器时shuffle必须为False
-            collate_fn=dataset.collate_fn,
-            num_workers=num_workers
-        )
-        
-        print(f"已启用标签均衡采样，前{int(len(dataset) * front_dense_ratio)}个样本中有标签样本密度为标准的{dense_factor}倍")
-    else:
-        # 使用常规DataLoader
-        dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            collate_fn=dataset.collate_fn,
-            num_workers=num_workers
-        )
-    
-    return dataloader
 
 class LabelBalancedSampler(Sampler):
     """
