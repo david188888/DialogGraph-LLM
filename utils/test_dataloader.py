@@ -9,8 +9,8 @@ from torch.utils.data import DataLoader
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # 导入需要的类
-from utils.model import AudioEncoder, AudioFeatureExtractor
 from utils.dataloader import DataLoaderConfig, AudioSegmentDataset, LabelBalancedSampler
+from utils.dataloader import DEFAULT_AUDIO_DIR, DEFAULT_SEGMENTS_DIR, DEFAULT_MODEL_PATH
 
 # 设置日志级别，减少输出
 logging.basicConfig(
@@ -53,11 +53,8 @@ def print_batch_info(batch, batch_idx):
 
 def test_standard_dataloader():
     """测试标准数据加载器"""
-    data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
-    
-    # 创建编码器和特征提取器
-    encoder = AudioEncoder.create_default_encoder()
-    feature_extractor = AudioFeatureExtractor(encoder=encoder)
+    # 使用自定义路径
+    data_dir = "/data/shared/Qwen/data"
     
     # 创建缓存目录
     cache_dir = os.path.join(data_dir, "features_cache")
@@ -73,15 +70,18 @@ def test_standard_dataloader():
         batch_size=1, # 测试时常用 batch_size=1
         shuffle=True,
         num_workers=0,
-        balance_labels=False # 标准加载器不使用均衡
+        balance_labels=False, # 标准加载器不使用均衡
+        model_path=DEFAULT_MODEL_PATH  # 使用默认模型路径
     )
 
     # 2. 创建数据集
     dataset = AudioSegmentDataset(
         data_path=config.data_path,
-        encoder=encoder, # 将 encoder 传递给数据集
+        model_path=DEFAULT_MODEL_PATH,
         labels_file=config.labels_file,
-        cache_dir=config.cache_dir
+        cache_dir=config.cache_dir,
+        audio_dir=DEFAULT_AUDIO_DIR,
+        segments_dir=DEFAULT_SEGMENTS_DIR
     )
 
     # 3. 创建 DataLoader
@@ -113,11 +113,8 @@ def test_standard_dataloader():
 
 def test_balanced_dataloader():
     """测试标签均衡数据加载器"""
-    data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
-    
-    # 创建编码器和特征提取器
-    encoder = AudioEncoder.create_default_encoder()
-    feature_extractor = AudioFeatureExtractor(encoder=encoder)
+    # 使用自定义路径
+    data_dir = "/data/shared/Qwen/data"
     
     # 创建缓存目录
     cache_dir = os.path.join(data_dir, "features_cache")
@@ -135,15 +132,18 @@ def test_balanced_dataloader():
         num_workers=0,
         balance_labels=True, # 启用标签均衡
         front_dense_ratio=0.6,
-        dense_factor=2.0
+        dense_factor=2.0,
+        model_path=DEFAULT_MODEL_PATH
     )
 
     # 2. 创建数据集
     dataset = AudioSegmentDataset(
         data_path=config.data_path,
-        encoder=encoder,
+        model_path=DEFAULT_MODEL_PATH,
         labels_file=config.labels_file,
-        cache_dir=config.cache_dir
+        cache_dir=config.cache_dir,
+        audio_dir=DEFAULT_AUDIO_DIR,
+        segments_dir=DEFAULT_SEGMENTS_DIR
     )
 
     # 3. 创建 Sampler
