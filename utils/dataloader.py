@@ -33,13 +33,12 @@ class DataLoaderConfig:
     balance_labels: bool = False # 默认不使用标签均衡
     front_dense_ratio: float = 0.6
     dense_factor: float = 2.0
-    model_path: Optional[str] = DEFAULT_MODEL_PATH # 默认模型路径
+    model_path: str = DEFAULT_MODEL_PATH # 默认模型路径
 
 class AudioSegmentDataset(Dataset):
     
-    def __init__(self, data_path, model_path: str = DEFAULT_MODEL_PATH, 
+    def __init__(self, data_path, model_path=DEFAULT_MODEL_PATH, 
                  labels_file='migrated_labels.csv', cache_dir='./features_cache', 
-                 system_prompt=None, 
                  audio_dir=None, segments_dir=None):
         """
         初始化音频分段数据集
@@ -49,16 +48,15 @@ class AudioSegmentDataset(Dataset):
             model_path: 模型路径或名称，用于加载Qwen2_5OmniAudioProcessor
             labels_file: 标签文件名称
             cache_dir: 特征缓存目录
-            system_prompt: 系统提示文本
             audio_dir: 音频文件夹路径，不指定则使用 data_path/audio
             segments_dir: 分段文件夹路径，不指定则使用 data_path/segments
         """
         self.data_path = data_path
+        self.model_path = model_path
         self.segments_dir = segments_dir if segments_dir else os.path.join(data_path, 'segments')
         self.audio_dir = audio_dir if audio_dir else os.path.join(data_path, 'audio')
         self.labels_file = os.path.join(data_path, labels_file)
         self.cache_dir = os.path.join(data_path, cache_dir) if cache_dir else None
-        self.system_prompt = system_prompt
         
         # 打印使用的路径
         print(f"使用音频目录: {self.audio_dir}")
@@ -77,54 +75,55 @@ class AudioSegmentDataset(Dataset):
             raise # 如果处理器无法加载，则无法继续
         
         # 标签映射字典，用于将字母标签映射为数字和one-hot
-        self.label_to_id = {}
-        self.id_to_label = {}
-        self.num_classes = 0
         
         # 加载数据
         self._load_data()
-        
-        # 构建标签映射
-        self._build_label_mapping()
-    
-    def _build_label_mapping(self):
-        """构建标签到ID的映射及确定类别数量"""
-        valid_labels = ['A', 'B', 'C', 'D']
-        self.num_classes = len(valid_labels)
-        for i, label in enumerate(valid_labels):
-            self.label_to_id[label] = i
-            self.id_to_label[i] = label
-        print(f"标签映射: {self.label_to_id}")
-        print(f"总共 {self.num_classes} 种类别")
 
-    def _label_to_onehot(self, label):
-        """将标签转换为one-hot向量，空标签返回全零向量"""
-        if label is None or label == '' or label == -1 or str(label).lower() == 'none':
-            return torch.zeros(self.num_classes)
-        str_label = str(label)
-        if str_label in self.label_to_id:
-            label_id = self.label_to_id[str_label]
-            one_hot = torch.zeros(self.num_classes)
-            one_hot[label_id] = 1.0
-            return one_hot
-        else:
-            print(f"警告：未识别的标签值 '{str_label}'，返回全零向量")
-            return torch.zeros(self.num_classes)
             
     def _load_data(self):
         """加载数据，建立音频片段与标签的对应关系，不限制片段数量"""
         self.data = []
         try:
+            # 加载原始音频标签和子音频标签
+            labels_dict = {}     # 存储原始音频标签
+            segment_speaker_dict = {}  # 存储子音频 speaker 信息
+            
             if os.path.exists(self.labels_file):
-                labels_df = pd.read_csv(self.labels_file, header=None)
-                labels_dict = {}
+                try:
+                    # 尝试读取有 header 的 CSV 文件
+                    labels_df = pd.read_csv(self.labels_file)
+                    print(f"加载标签文件: {self.labels_file}，列名: {labels_df.columns.tolist()}")
+                except:
+                    # 尝试读取无 header 的 CSV 文件
+                    labels_df = pd.read_csv(self.labels_file, header=None, names=['audio_id', 'speaker', 'label'])
+                    print(f"加载标签文件(无header): {self.labels_file}")
+                
+                # 同时处理原始音频和子音频的标签和speaker信息
                 for _, row in labels_df.iterrows():
+                    audio_id = str(row[0] if isinstance(row, pd.Series) else row['audio_id'])
+                    
+                    # 获取label信息(第3列)
+                    label_value = None
                     if len(row) >= 3:
-                        audio_id = str(row[0])
-                        label_value = row[2] if pd.notna(row[2]) and row[2] != 'none' else None
-                        labels_dict[audio_id] = {'label': label_value, 'speaker': None}
+                        col_idx = 2
+                        col_name = 'label' if 'label' in labels_df.columns else col_idx
+                        label_value = row[col_name] if pd.notna(row[col_name]) and str(row[col_name]).lower() != 'none' else None
+                    
+                    # 获取speaker信息(第2列)
+                    speaker_value = None
+                    if len(row) >= 2:
+                        col_idx = 1
+                        col_name = 'speaker' if 'speaker' in labels_df.columns else col_idx
+                        speaker_value = row[col_name] if pd.notna(row[col_name]) else None
+                    
+                    # 判断是否为子音频，子音频的audio_id通常包含下划线加数字
+                    if '_' in audio_id:
+                        # 是子音频：存储speaker信息
+                        segment_speaker_dict[audio_id] = speaker_value
+                    else:
+                        # 是原始音频：存储label和speaker信息
+                        labels_dict[audio_id] = {'label': label_value, 'speaker': speaker_value}
             else:
-                labels_dict = {}
                 print(f"警告：找不到标签文件 {self.labels_file}")
             
             if not os.path.exists(self.segments_dir):
@@ -143,30 +142,54 @@ class AudioSegmentDataset(Dataset):
                     continue
                 
                 segment_files = []
+                segment_speakers = []  # 保存每个子音频对应的speaker
+                
                 for file_name in os.listdir(self.segments_dir):
                     if file_name.startswith(f"{phone_id}_") and file_name.endswith('.wav'):
-                        segment_files.append(os.path.join(self.segments_dir, file_name))
+                        segment_path = os.path.join(self.segments_dir, file_name)
+                        segment_id = os.path.basename(segment_path).split('.')[0]  # 不包含扩展名
+                        
+                        # 获取子音频的speaker
+                        speaker_id = segment_speaker_dict.get(segment_id)
+                        
+                        segment_files.append(segment_path)
+                        segment_speakers.append(speaker_id)
                 
                 if not segment_files:
                     print(f"警告：电话ID {phone_id} 没有找到对应的片段文件")
                     continue
                 
+                # 同时排序segment_files和segment_speakers
                 try:
-                    segment_files.sort(key=lambda x: int(os.path.basename(x).split('_')[-1].split('.')[0]))
+                    # 将segment_files和segment_speakers打包在一起排序
+                    segment_pairs = list(zip(segment_files, segment_speakers))
+                    segment_pairs.sort(key=lambda x: int(os.path.basename(x[0]).split('_')[-1].split('.')[0]))
+                    # 拆分回两个列表
+                    segment_files, segment_speakers = zip(*segment_pairs) if segment_pairs else ([], [])
+                    segment_files = list(segment_files)
+                    segment_speakers = list(segment_speakers)
                 except Exception as e:
                     print(f"对片段文件排序时出错: {e}，使用文件名排序")
-                    segment_files.sort()
+                    # 保持两个列表顺序一致
+                    segment_pairs = list(zip(segment_files, segment_speakers))
+                    segment_pairs.sort(key=lambda x: x[0])  # 按文件名排序
+                    segment_files, segment_speakers = zip(*segment_pairs) if segment_pairs else ([], [])
+                    segment_files = list(segment_files)
+                    segment_speakers = list(segment_speakers)
                 
+                # 从labels_dict获取原始音频的标签和speaker
                 label_info = labels_dict.get(phone_id, {})
                 label = label_info.get('label', None)
-                speaker = label_info.get('speaker', None)
+                
+                # 使用子音频的speakers列表
+                filtered_speakers = [s for s in segment_speakers if s is not None]
                 
                 self.data.append({
                     'phone_id': phone_id,
                     'original_audio_file': original_audio_file,
                     'segment_files': segment_files,
                     'label': label,
-                    'speaker': speaker,
+                    'speaker': filtered_speakers,  # 使用子音频的speaker列表
                     'num_segments': len(segment_files)
                 })
             
@@ -219,7 +242,7 @@ class AudioSegmentDataset(Dataset):
                     audio_path = audio_path[7:]
                 
                 # 加载音频
-                audio, sr = librosa.load(audio_path, sr=16000)
+                audio = librosa.load(audio_path, sr=16000)[0]
                 
                 # 使用Qwen2_5OmniAudioProcessor处理音频
                 feature_dict = self.processor(
@@ -229,11 +252,11 @@ class AudioSegmentDataset(Dataset):
                     return_tensors="pt"
                 )
                 
-                print(f"特征字典: {feature_dict}")
                 
                 # 优先使用编码后的特征（如果有）
                 if "audio_encoded_features" in feature_dict and feature_dict["audio_encoded_features"].numel() > 0:
                     features = feature_dict["audio_encoded_features"].squeeze(0)
+                    print(f"特征处理完毕{cache_filename}")
                 else:
                     features = feature_dict["input_features"].squeeze(0)
                 
@@ -252,27 +275,19 @@ class AudioSegmentDataset(Dataset):
 
     def _get_audio_segments(self, item):
         """
-        获取音频片段的特征和原始音频的特征。
+        获取音频片段的特征。
         使用 Qwen2_5OmniAudioProcessor 并应用缓存。
-        
+
         参数:
             item: 数据项，包含原始音频和片段音频的路径
-            
+
         返回:
-            原始音频特征和分段特征列表的元组
+            分段特征列表
         """
-        phone_id = item['phone_id']
-        original_audio_file = item['original_audio_file']
         segment_files = item['segment_files']
-        
-        # --- 处理原始音频特征 --- 
-        original_features = self._get_audio_features_with_cache(
-            original_audio_file, 
-            "original_features", 
-            f"{phone_id}.pt"
-        )
-        
-        # --- 处理分段音频特征 --- 
+
+
+        # --- 处理分段音频特征 ---
         segment_features = []
         for i, segment_file in enumerate(segment_files):
             segment_name = os.path.basename(segment_file).split('.')[0]  # 不包含扩展名
@@ -284,10 +299,12 @@ class AudioSegmentDataset(Dataset):
             
             if segment_feature.numel() > 0: # 只有非空特征才添加
                 segment_features.append(segment_feature)
+                # print(f"已经成功加载segment_feature {segment_name}")
             else:
                 print(f"警告：无法提取或加载片段特征，已跳过: {segment_file}")
         
-        return original_features, segment_features
+        # 返回 segment_features，不再返回 original_features
+        return segment_features
     
     def __getitem__(self, idx):
         """获取指定索引的样本"""
@@ -295,34 +312,18 @@ class AudioSegmentDataset(Dataset):
         phone_id = item['phone_id']
         label = item.get('label', None)
         speaker = item.get('speaker', None)
-        
-        # 获取原始音频特征和分段特征
-        original_features, segment_features = self._get_audio_segments(item)
-        
-        # 保存原始标签
-        original_label = label
-        
-        # 标签ID和one-hot处理
-        if label is None or label == '' or label == -1:
-            label_id = -1
-            label_onehot = torch.zeros(self.num_classes)
-        else:
-            str_label = str(label)
-            label_id = self.label_to_id.get(str_label, -1)
-            label_onehot = self._label_to_onehot(original_label)
-        
+
+        # 获取分段特征 
+        segment_features = self._get_audio_segments(item)
+
         # 构建结果字典
         result = {
             'phone_id': phone_id,
-            'original_features': original_features, # [time, feat_dim]
             'segment_features': segment_features, # List of [time, feat_dim]
             'num_segments': len(segment_features),
-            'label': label_id,                  
-            'original_label': original_label,   
-            'label_onehot': label_onehot,       
+            'label': label,   
             'speaker': speaker,
-            'original_audio_file': item['original_audio_file'],
-            'segment_files': item['segment_files']
+            'original_audio_file': item['original_audio_file'] # 确保原始音频路径仍然返回
         }
         
         return result
@@ -338,57 +339,30 @@ class AudioSegmentDataset(Dataset):
         返回:
             整理好的批次数据字典
         """
-        batch_size = len(batch)
         
         phone_ids = [item['phone_id'] for item in batch]
-        labels = [item.get('label', -1) for item in batch]
-        original_labels = [item.get('original_label', '') for item in batch]
-        label_onehots = [item.get('label_onehot', torch.zeros(self.num_classes)) for item in batch]
+        label = [item.get('label', '') for item in batch]
         speakers = [item.get('speaker', -1) for item in batch]
-        segment_files = [item['segment_files'] for item in batch]
         original_audio_files = [item['original_audio_file'] for item in batch]
         num_segments = [item['num_segments'] for item in batch]
         max_num_segments = max(num_segments) if num_segments else 0
-        
-        # --- 处理原始特征填充 --- 
-        original_features = [item['original_features'] for item in batch]
-        # 获取特征维度（假设所有特征维度相同）
-        feat_dim = original_features[0].shape[-1] if batch_size > 0 and original_features[0].numel() > 0 else 80 # 默认 Whisper feat dim
-        # 找到最大时间长度
-        max_orig_len = max(feat.shape[0] for feat in original_features if feat.numel() > 0) if any(f.numel() > 0 for f in original_features) else 0
-        
-        padded_original_features = []
-        original_attention_mask = []
-        
-        for feat in original_features:
-            if feat.numel() == 0: # 处理空特征
-                 padded_feat = torch.zeros((max_orig_len, feat_dim))
-                 mask = torch.zeros(max_orig_len, dtype=torch.long)
-            else:
-                current_len = feat.shape[0]
-                padding_len = max_orig_len - current_len
-                if padding_len > 0:
-                    padded_feat = torch.nn.functional.pad(feat, (0, 0, 0, padding_len), value=0.0) # 填充时间维度
-                    mask = torch.cat([torch.ones(current_len, dtype=torch.long), torch.zeros(padding_len, dtype=torch.long)])
-                else:
-                    padded_feat = feat
-                    mask = torch.ones(current_len, dtype=torch.long)
-            padded_original_features.append(padded_feat)
-            original_attention_mask.append(mask)
-            
-        original_features_tensor = torch.stack(padded_original_features) if padded_original_features else torch.empty(0)
-        original_mask_tensor = torch.stack(original_attention_mask) if original_attention_mask else torch.empty(0)
         
         # --- 处理片段特征填充 --- 
         all_segment_features = [] # List[List[Tensor]]
         all_segment_masks = []    # List[List[Tensor]]
         max_segment_len = 0       # 所有片段中的最大长度
 
-        # 先收集所有片段特征并找到最大长度
+        # 先收集所有片段特征并找到最大长度和特征维度
         temp_all_segments = []
+        feat_dim = 80  # 默认特征维度
         for item in batch:
             item_segments = item['segment_features']
             temp_all_segments.extend(item_segments)
+            # 从第一个非空特征中获取特征维度
+            if item_segments and item_segments[0].numel() > 0:
+                feat_dim = item_segments[0].shape[-1]
+                break
+        
         if temp_all_segments:
              max_segment_len = max(seg.shape[0] for seg in temp_all_segments if seg.numel() > 0) if any(s.numel() > 0 for s in temp_all_segments) else 0
         
@@ -423,27 +397,16 @@ class AudioSegmentDataset(Dataset):
         segment_features_tensor = torch.stack(all_segment_features) if all_segment_features else torch.empty(0) # [batch, max_num_segments, max_segment_len, feat_dim]
         segment_mask_tensor = torch.stack(all_segment_masks) if all_segment_masks else torch.empty(0)          # [batch, max_num_segments, max_segment_len]
         
-        # 将标签转换为张量
-        labels_tensor = torch.tensor(labels)
-        label_onehots_tensor = torch.stack(label_onehots)
         
-        # 构建返回的批次字典
+        # 构建返回的批次字典，移除原始特征相关字段
         batch_dict = {
             'phone_ids': phone_ids,
-            'original_features': original_features_tensor, # [batch, max_orig_len, feat_dim]
-            'original_attention_mask': original_mask_tensor, # [batch, max_orig_len]
             'segment_features': segment_features_tensor,    # [batch, max_num_segments, max_segment_len, feat_dim]
             'segment_attention_mask': segment_mask_tensor,    # [batch, max_num_segments, max_segment_len]
             'num_segments': num_segments,
-            'max_num_segments': max_num_segments,
-            'labels': labels_tensor,
-            'original_labels': original_labels,
-            'label_onehots': label_onehots_tensor,  
+            'label': label,
             'speakers': speakers,
-            'segment_files': segment_files,
             'original_audio_files': original_audio_files,
-            'batch_size': batch_size,
-            'num_classes': self.num_classes 
         }
         
         return batch_dict

@@ -22,33 +22,16 @@ logger = logging.getLogger(__name__)
 def print_batch_info(batch, batch_idx):
     """简洁打印批次的信息和标签分布"""
     if batch_idx == 0:  # 第一个批次显示完整信息
-        logger.info(f"\n批次 {batch_idx}:")
-        logger.info(f"批次大小: {batch['batch_size']}")
         logger.info(f"电话ID: {batch['phone_ids']}")
-        logger.info(f"数值标签: {batch['labels'].tolist()}")
-        
-        if 'original_labels' in batch:
-            logger.info(f"原始标签: {batch['original_labels']}")
-            
-        if 'label_onehots' in batch:
-            logger.info(f"One-hot标签形状: {batch['label_onehots'].shape}")
-            logger.info(f"类别数量: {batch['num_classes']}")
-            logger.info(f"One-hot标签示例: {batch['label_onehots'][0]}")
+        logger.info(f"数值标签: {batch['label']}")
             
         logger.info(f"片段数量: {batch['num_segments']}")
-        
-        # 打印原始特征形状
-        logger.info("\n原始音频特征形状:")
-        for i, features in enumerate(batch['original_features']):
-            logger.info(f"  样本{i}: {features.shape}")
         
         # 打印分段特征形状
         logger.info("\n分段音频特征形状:")
 
     else:  # 其他批次只显示标签
-        info_str = f"批次 {batch_idx} - 数值标签: {batch['labels'].tolist()}"
-        if 'original_labels' in batch:
-            info_str += f", 原始标签: {batch['original_labels']}"
+        info_str = f"批次 {batch_idx} - 数值标签: {batch['label']}"
         logger.info(info_str)
 
 def test_standard_dataloader():
@@ -101,7 +84,7 @@ def test_standard_dataloader():
     for batch_idx, batch in enumerate(dataloader):
         print_batch_info(batch, batch_idx)
         labels = batch['labels'].tolist()
-        labeled_count += sum(1 for label in labels if label != -1)  # 修改为计算不等于-1的标签数量（有标签样本）
+        labeled_count += sum(1 for label in labels if label is None)  # 修改为计算不等于-1的标签数量（有标签样本）
         total_count += len(labels)
         
         if batch_idx >= 4:
@@ -172,8 +155,8 @@ def test_balanced_dataloader():
     
     for batch_idx, batch in enumerate(dataloader):
         print_batch_info(batch, batch_idx)
-        labels = batch['labels'].tolist()
-        labeled_count += sum(1 for label in labels if label != -1)  # 修改为正确判断有标签样本
+        labels = batch['label']
+        labeled_count += sum(1 for label in labels if label is None)  # 修改为正确判断有标签样本
         total_count += len(labels)
         
         if batch_idx >= 4:
@@ -196,10 +179,11 @@ def test_balanced_dataloader():
         if batch_idx >= batch_count:
             break
             
-        labels = batch['labels'].tolist()
-        labeled_count_late += sum(1 for label in labels if label != -1)
+        labels = batch['label']
+        print(label for label in labels)
+        labeled_count_late += sum(1 for label in labels if label is None)
         total_count_late += len(labels)
-        logger.info(f"批次 {batch_idx} - 标签: {batch['labels'].tolist()}")
+        logger.info(f"批次 {batch_idx} - 标签: {batch['label']}")
     
     if total_count_late > 0:
         logger.info(f"后5个批次中，有标签样本比例: {labeled_count_late}/{total_count_late} ({labeled_count_late/total_count_late:.2%})")

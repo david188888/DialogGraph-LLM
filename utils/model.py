@@ -167,13 +167,15 @@ class Qwen2_5OmniAudioProcessor(ProcessorMixin):
                 return_attention_mask=True, 
                 padding="max_length",
                 return_tensors=return_tensors,
-                # **kwargs
+                **kwargs
             )
+            
+            
             
             # 重命名特征以符合Qwen2.5OmniAudioEncoder的输入格式
             input_features = audio_features.pop("input_features")
             feature_attention_mask = audio_features.pop("attention_mask") if "attention_mask" in audio_features else None
-            
+            print(f"shape of input_feature{input_features.shape}")
             outputs = {
                 "input_features": input_features,
                 "feature_attention_mask": feature_attention_mask,
@@ -184,25 +186,38 @@ class Qwen2_5OmniAudioProcessor(ProcessorMixin):
                 with torch.no_grad():
                     # 计算音频长度
                     if feature_attention_mask is not None:
-                        feature_lens = feature_attention_mask.sum(-1)
-                        audio_feat_lengths, audio_output_lengths = self.audio_encoder._get_feat_extract_output_lengths(feature_lens)
+                        audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+                        input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
+
+
                     else:
-                        feature_lens = None
-                        audio_feat_lengths = None
-                    
+                        audio_feature_lengths = None
+                        # 使用_get_feat_extract_output_lengths获取经过音频编码器处理后的长度
+                    audio_feat_lengths, audio_output_lengths = self.audio_encoder._get_feat_extract_output_lengths(audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1))
+                    feature_lens = (
+                        audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
+                    )
+
                     # 使用audio_encoder编码音频特征
                     audio_encoder_outputs = self.audio_encoder(
                         input_features,
-                        feature_lens=feature_lens,
-                        aftercnn_lens=audio_feat_lengths,
+                        feature_lens=feature_lens,  # 原始特征长度
+                        aftercnn_lens=audio_feat_lengths,  # 经过CNN处理后的长度
                         output_hidden_states=False,
                         return_dict=True,
                     )
                     
                     # 添加编码后的特征到输出
                     outputs["audio_encoded_features"] = audio_encoder_outputs.last_hidden_state
+                    
+                    # 检查并添加attention_mask
                     if hasattr(audio_encoder_outputs, "attention_mask"):
                         outputs["audio_encoded_attention_mask"] = audio_encoder_outputs.attention_mask
+                    else:
+                        print("audio_encoder_outputs没有attention_mask属性")
+                        
+                    # 将音频输出长度也添加到输出中，以便后续使用
+                    outputs["audio_output_lengths"] = audio_output_lengths
             
             return BatchFeature(
                 data=outputs,

@@ -4,21 +4,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-import numpy as np
+
 from tqdm import tqdm
 import logging
 import wandb
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
-from torchvision import transforms
-import random
 import sys
 
 from utils.graph import DialogueGraphModel
-from utils.audio_augment import AudioAugmenter
 from utils.dataloader import AudioSegmentDataset, LabelBalancedSampler, DataLoaderConfig
-from utils.model import AudioEncoder
 
 # 设置日志
 logging.basicConfig(
@@ -26,425 +21,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-class AudioDialogueDataset(Dataset):
-    """音频对话数据集，用于加载和处理音频对话数据"""
-    
-    def __init__(self, data_path, tokenizer, max_length=512, labeled_ratio=0.3, total_batches=1000, preprocessed_path=None):
-        """
-        初始化数据集
-        
-        参数:
-            data_path: 数据路径
-            tokenizer: 分词器
-            max_length: 最大序列长度
-            labeled_ratio: 有标签数据的比例
-            total_batches: 训练总批次数
-            preprocessed_path: 预处理数据路径
-        """
-        self.data_path = data_path
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.labeled_ratio = labeled_ratio
-        self.total_batches = total_batches
-        self.preprocessed_path = preprocessed_path or os.path.join(data_path, "augmented")
-                    
-        # 将有标签数据分成k组，用于均匀分布在训练批次中
-        self.batch_groups = self._create_batch_groups()
-        self.current_group_idx = 0
-        
-        # 当前批次计数
-        self.current_batch = 0
-        
-
-    
-    def _split_data(self):
-        """划分有标签和无标签数据"""
-        np.random.shuffle(self.data)
-        num_labeled = int(len(self.data) * self.labeled_ratio)
-        
-        self.labeled_data = self.data[:num_labeled]
-        self.unlabeled_data = self.data[num_labeled:]
-        
-        logger.info(f"有标签数据数量: {len(self.labeled_data)}")
-        logger.info(f"无标签数据数量: {len(self.unlabeled_data)}")
-        
-    def _create_batch_groups(self):
-        """
-        将有标签数据分成k组,以便在训练过程中均匀分布
-        k的值基于总批次数和有标签数据数量
-        """
-        labeled_data = self.labeled_data.copy()
-        random.shuffle(labeled_data)
-        
-        # 确定分组数量，至少为1
-        k = min(len(labeled_data), self.total_batches)
-        k = max(1, k)
-        
-        # 将有标签数据均匀分成k组
-        groups = []
-        items_per_group = len(labeled_data) // k
-        remainder = len(labeled_data) % k
-        
-        start = 0
-        for i in range(k):
-            group_size = items_per_group + (1 if i < remainder else 0)
-            end = start + group_size
-            groups.append(labeled_data[start:end])
-            start = end
-            
-        return groups
-    
-    def get_next_batch(self, batch_size):
-        """
-        获取下一个批次的数据，保证有标签数据均匀分布
-        
-        参数:
-            batch_size: 批次大小
-            
-        返回:
-            批次数据字典
-        """
-        # 更新当前批次计数
-        self.current_batch += 1
-        
-        # 获取当前批次的有标签数据组
-        group_idx = (self.current_batch - 1) % len(self.batch_groups)
-        labeled_batch = self.batch_groups[group_idx]
-        
-        # 从无标签数据中随机选择
-        unlabeled_batch_size = batch_size - len(labeled_batch)
-        if len(self.unlabeled_data) > 0:
-            unlabeled_batch = random.sample(self.unlabeled_data, min(unlabeled_batch_size, len(self.unlabeled_data)))
-        else:
-            unlabeled_batch = []
-        
-        # 合并有标签和无标签数据
-        batch = []
-        
-        # 处理有标签数据
-        for item in labeled_batch:
-            # 获取数据项
-            if isinstance(item, dict):
-                audio_features = item.get("audio_features")
-                graph_features = item.get("graph_features")
-                speaker_ids = item.get("speaker_ids")
-                label = item.get("label")
-            else:
-                # 假设是元组
-                audio_features, graph_features, speaker_ids, label = item
-            
-            batch.append({
-                "audio_features": audio_features,
-                "weak_audio_features": audio_features,  # 有标签数据不需要弱增强
-                "strong_audio_features": audio_features,  # 有标签数据不需要强增强
-                "graph_features": graph_features,
-                "speaker_ids": speaker_ids,
-                "label": label,
-                "is_labeled": True
-            })
-        
-        # 处理无标签数据
-        for item in unlabeled_batch:
-                batch.append({
-                    "audio_features": item.get("original_features", item.get("audio_features")),
-                    "weak_audio_features": item.get("weak_audio_features"),
-                    "strong_audio_features": item.get("strong_audio_features"),
-                    "graph_features": item.get("graph_features"),
-                    "speaker_ids": item.get("speaker_ids"),
-                    "label": item.get("label", 0),  # 默认标签
-                    "is_labeled": False
-                })
-                
-                # 对无标签数据应用弱增强和强增强
-                weak_audio_features = self.weak_augment(audio_features)
-                strong_audio_features = self.strong_augment(audio_features)
-                
-                batch.append({
-                    "audio_features": audio_features,  # 原始特征
-                    "weak_audio_features": weak_audio_features,  # 弱增强特征
-                    "strong_audio_features": strong_audio_features,  # 强增强特征
-                    "graph_features": graph_features,
-                    "speaker_ids": speaker_ids,
-                    "label": label,
-                    "is_labeled": False
-                })
-        
-        return self.collate_fn(batch)
-    
-    def collate_fn(self, batch):
-        """
-        整理批次数据
-        
-        参数:
-            batch: 批次数据
-            
-        返回:
-            整理好的批次数据
-        """
-        audio_features = torch.stack([item["audio_features"] for item in batch])
-        weak_audio_features = torch.stack([item["weak_audio_features"] for item in batch])
-        strong_audio_features = torch.stack([item["strong_audio_features"] for item in batch])
-        graph_features = torch.stack([item["graph_features"] for item in batch])
-        speaker_ids = torch.stack([item["speaker_ids"] for item in batch])
-        labels = torch.tensor([item["label"] for item in batch])
-        is_labeled = torch.tensor([item["is_labeled"] for item in batch])
-        
-        # 构建标准提示 - 使用原始特征和弱增强特征
-        orig_prompts = [self.construct_prompt(audio, graph) for audio, graph in zip(audio_features, graph_features)]
-        weak_prompts = [self.construct_prompt(audio, graph) for audio, graph in zip(weak_audio_features, graph_features)]
-        strong_prompts = [self.construct_prompt(audio, graph) for audio, graph in zip(strong_audio_features, graph_features)]
-        
-        # 构建置信度提示 - 用于获取置信度分布
-        confidence_prompts = [self.construct_confidence_prompt(audio, graph) for audio, graph in zip(weak_audio_features, graph_features)]
-        
-        # 编码标准提示
-        orig_encodings = self.tokenizer(
-            orig_prompts,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt"
-        )
-        
-        weak_encodings = self.tokenizer(
-            weak_prompts,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt"
-        )
-        
-        strong_encodings = self.tokenizer(
-            strong_prompts,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt"
-        )
-        
-        # 编码置信度提示
-        confidence_encodings = self.tokenizer(
-            confidence_prompts,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt"
-        )
-        
-        # 添加图特征的原始形式，用于后续直接融合
-        return {
-            "input_ids": orig_encodings.input_ids,
-            "attention_mask": orig_encodings.attention_mask,
-            "weak_input_ids": weak_encodings.input_ids,
-            "weak_attention_mask": weak_encodings.attention_mask,
-            "strong_input_ids": strong_encodings.input_ids,
-            "strong_attention_mask": strong_encodings.attention_mask,
-            "confidence_input_ids": confidence_encodings.input_ids,
-            "confidence_attention_mask": confidence_encodings.attention_mask,
-            "audio_features": audio_features,
-            "weak_audio_features": weak_audio_features,
-            "strong_audio_features": strong_audio_features,
-            "graph_features": graph_features,
-            "speaker_ids": speaker_ids,
-            "labels": labels,
-            "is_labeled": is_labeled,
-            # 添加原始提示文本，方便调试
-            "orig_prompts": orig_prompts,
-            "weak_prompts": weak_prompts,
-            "strong_prompts": strong_prompts,
-            "confidence_prompts": confidence_prompts
-        }
-    
-    def construct_prompt(self, audio_features, graph_features):
-        """
-        构建融合图结构信息的提示
-        
-        参数:
-            audio_features: 音频特征
-            graph_features: 图特征
-            
-        返回:
-            构建好的提示文本
-        """
-        # 将特征转换为文本形式
-        audio_str = self._features_to_str(audio_features)
-        
-        # 构建更详细的图结构描述
-        if isinstance(graph_features, torch.Tensor) and graph_features.ndim > 1:
-            # 提取图的结构信息
-            num_nodes = graph_features.size(0)
-            graph_summary = f"对话包含{num_nodes}个交互节点，"
-            graph_summary += f"特征维度为{graph_features.size(1)}，"
-            graph_summary += f"关键节点特征：{self._features_to_str(graph_features[0])}"
-        else:
-            graph_summary = self._features_to_str(graph_features)
-            
-        # 构建融合图信息的提示
-        prompt = (
-            f"请分析以下对话数据:\n"
-            f"图结构信息: {graph_summary}\n"
-            f"音频特征: {audio_str}\n"
-            f"根据上述信息，分析用户的购买意向。"
-        )
-        
-        return prompt
-    
-    def construct_confidence_prompt(self, audio_features, graph_features):
-        """
-        构建用于获取置信度分布的提示，融合图结构信息
-        
-        参数:
-            audio_features: 音频特征
-            graph_features: 图特征
-            
-        返回:
-            用于获取置信度分布的提示文本
-        """
-        # 构建基本提示
-        base_prompt = self.construct_prompt(audio_features, graph_features)
-        
-        # 添加置信度输出格式要求
-        prompt = (
-            f"{base_prompt}\n\n"
-            f"请按照以下格式输出分析结果:\n"
-            f"分析: [您的分析内容]\n"
-            f"类别: [用户购买意向类别，如'高意向'、'中意向'、'低意向'或'无意向']\n"
-            f"置信度分布: [四个类别的概率分布，格式为'高意向:0.7,中意向:0.2,低意向:0.05,无意向:0.05']\n"
-        )
-        
-        return prompt
-    
-    def _features_to_str(self, features):
-        """将特征转换为更可读的文本形式"""
-        # 优化特征文本表示，避免过长数字列表
-        if isinstance(features, torch.Tensor) and features.ndim > 1:
-            # 对于多维特征，提取关键统计信息
-            stats = {
-                "均值": f"{features.mean().item():.3f}",
-                "最大值": f"{features.max().item():.3f}",
-                "最小值": f"{features.min().item():.3f}"
-            }
-            return f"[特征统计: {stats}]"
-        elif isinstance(features, torch.Tensor):
-            # 如果是1D张量，只取前几个值和基本统计量
-            if (len(features) > 5):
-                return f"[特征样本: {features[:5].tolist()}, 均值: {features.mean().item():.3f}]"
-            else:
-                return str(features.tolist())
-        else:
-            return str(features)
-
-    def _load_preprocessed_data(self):
-        """加载预处理好的数据"""
-        logger.info(f"加载预处理数据: {self.preprocessed_path}")
-        
-        try:
-            # 检查是否存在配对数据文件
-            paired_path = os.path.join(self.preprocessed_path, "fixmatch_paired_data.pt")
-            
-            if os.path.exists(paired_path):
-                logger.info(f"加载预处理的FixMatch配对数据: {paired_path}")
-                self.unlabeled_paired_data = torch.load(paired_path)
-                logger.info(f"成功加载无标签配对数据: {len(self.unlabeled_paired_data)}个样本")
-                
-                # 有标签数据仍然需要从原始数据中加载
-                labeled_data_path = os.path.join(self.data_path, "labeled_data.pt")
-                if os.path.exists(labeled_data_path):
-                    self.labeled_data = torch.load(labeled_data_path)
-                    logger.info(f"成功加载有标签数据: {len(self.labeled_data)}个样本")
-                else:
-                    # 如果找不到独立的有标签数据文件，从原始数据中提取
-                    self.data = self._load_data()
-                    # 按比例提取有标签数据
-                    num_labeled = int(len(self.data) * self.labeled_ratio)
-                    self.labeled_data = self.data[:num_labeled]
-                    logger.info(f"从原始数据中提取有标签数据: {len(self.labeled_data)}个样本")
-                
-                # 将无标签配对数据设置为无标签数据
-                self.unlabeled_data = self.unlabeled_paired_data
-                
-                # 原始数据是有标签和无标签数据的合并
-                self.data = self.labeled_data + self.unlabeled_data
-                
-                return
-            
-            # 如果没有配对数据，尝试分别加载弱增强和强增强数据
-            weak_path = os.path.join(self.preprocessed_path, "weak_augmented_data.pt")
-            strong_path = os.path.join(self.preprocessed_path, "strong_augmented_data.pt")
-            
-            if os.path.exists(weak_path) and os.path.exists(strong_path):
-                logger.info(f"加载单独的弱增强数据: {weak_path}")
-                logger.info(f"加载单独的强增强数据: {strong_path}")
-                
-                weak_data = torch.load(weak_path)
-                strong_data = torch.load(strong_path)
-                logger.info(f"成功加载弱增强数据: {len(weak_data)}个样本")
-                logger.info(f"成功加载强增强数据: {len(strong_data)}个样本")
-                
-                # 合并弱增强和强增强数据为配对数据
-                # 假设两者样本数量相同且顺序对应
-                self.unlabeled_paired_data = []
-                if len(weak_data) == len(strong_data):
-                    orig_samples = [s for s in weak_data if s.get("augmentation") == "original"]
-                    weak_samples = [s for s in weak_data if s.get("augmentation") == "weak"]
-                    strong_samples = strong_data
-                    
-                    # 确保样本数量匹配
-                    min_len = min(len(orig_samples), len(weak_samples), len(strong_samples))
-                    if min_len > 0:
-                        for i in range(min_len):
-                            paired_sample = {k: v for k, v in orig_samples[i].items() if k != "augmentation"}
-                            paired_sample["original_features"] = orig_samples[i].get("audio_features").clone()
-                            paired_sample["weak_audio_features"] = weak_samples[i].get("audio_features").clone()
-                            paired_sample["strong_audio_features"] = strong_samples[i].get("audio_features").clone()
-                            paired_sample["is_labeled"] = False
-                            self.unlabeled_paired_data.append(paired_sample)
-                        
-                        logger.info(f"成功合并为配对数据: {len(self.unlabeled_paired_data)}个样本")
-                    else:
-                        logger.warning("无法配对弱增强和强增强数据，回退到标准处理")
-                        self.data = self._load_data()
-                        self._split_data()
-                        return
-                else:
-                    logger.warning("弱增强和强增强数据数量不匹配，回退到标准处理")
-                    self.data = self._load_data()
-                    self._split_data()
-                    return
-                
-                # 有标签数据仍然需要从原始数据中加载
-                labeled_data_path = os.path.join(self.data_path, "labeled_data.pt")
-                if os.path.exists(labeled_data_path):
-                    self.labeled_data = torch.load(labeled_data_path)
-                    logger.info(f"成功加载有标签数据: {len(self.labeled_data)}个样本")
-                else:
-                    # 如果找不到独立的有标签数据文件，从原始数据中提取
-                    orig_data = self._load_data()
-                    # 按比例提取有标签数据
-                    num_labeled = int(len(orig_data) * self.labeled_ratio)
-                    self.labeled_data = orig_data[:num_labeled]
-                    logger.info(f"从原始数据中提取有标签数据: {len(self.labeled_data)}个样本")
-                
-                # 将无标签配对数据设置为无标签数据
-                self.unlabeled_data = self.unlabeled_paired_data
-                
-                # 原始数据是有标签和无标签数据的合并
-                self.data = self.labeled_data + self.unlabeled_data
-                
-                return
-            
-            # 如果找不到预处理数据，回退到标准处理
-            logger.warning(f"未找到预处理数据，回退到标准处理")
-            self.data = self._load_data()
-            self._split_data()
-        
-        except Exception as e:
-            logger.error(f"加载预处理数据失败: {e}")
-            logger.warning("回退到标准处理")
-            self.data = self._load_data()
-            self._split_data()
-
 
 class AdaptiveThresholdTrainer:
     """适应性音频分段训练器，支持Qwen Omni模型训练"""
@@ -489,7 +65,7 @@ class AdaptiveThresholdTrainer:
         
         # 初始化优化器
         self._init_optimizer()
-        
+    
     def _init_optimizer(self):
         """初始化优化器"""
         # 收集需要优化的参数
@@ -525,8 +101,6 @@ class AdaptiveThresholdTrainer:
         save_interval=1000,
         use_wandb=False,
         augment_segments=True,
-        preprocessed_path=None,
-        max_length=512,
         system_prompt=None,
         num_segments=None,
         batch_size=8,
@@ -545,8 +119,6 @@ class AdaptiveThresholdTrainer:
             save_interval: 保存间隔
             use_wandb: 是否使用wandb记录实验
             augment_segments: 是否增强分段
-            preprocessed_path: 预处理数据路径
-            max_length: 最大序列长度
             system_prompt: 系统提示文本
             num_segments: 每个音频切分的片段数量，None表示随机
             batch_size: 批次大小
@@ -571,27 +143,21 @@ class AdaptiveThresholdTrainer:
         train_config = DataLoaderConfig(
             data_path=train_data_path,
             labels_file='migrated_labels.csv',
-            max_segments=num_segments or 10, # 使用传入的num_segments或默认值
             cache_dir='features_cache',
-            batch_size=batch_size, # 使用传入的batch_size
             shuffle=not use_balanced_sampling, # 如果使用平衡采样，shuffle为False
             num_workers=0, # 避免多进程问题
             system_prompt=system_prompt,
             balance_labels=use_balanced_sampling,
-            # front_dense_ratio 和 dense_factor 使用默认值
+            model_path=self.processor.name_or_path if hasattr(self.processor, 'name_or_path') else None
+ 
         )
 
         # 2. 创建 Dataset 实例
-        # 注意：feature_extractor 和 encoder 需要在这里创建或获取
-        # 这里假设我们创建一个默认的 encoder
-        audio_encoder = AudioEncoder.create_default_encoder()
         train_dataset = AudioSegmentDataset(
             data_path=train_config.data_path,
-            encoder=audio_encoder,
+            model_path=train_config.model_path,
             labels_file=train_config.labels_file,
-            max_segments=train_config.max_segments,
-            cache_dir=train_config.cache_dir,
-            system_prompt=train_config.system_prompt
+            cache_dir=train_config.cache_dir
         )
 
         # 3. 创建 DataLoader
@@ -621,22 +187,20 @@ class AdaptiveThresholdTrainer:
             val_config = DataLoaderConfig(
                 data_path=val_data_path,
                 labels_file='migrated_labels.csv',
-                max_segments=num_segments or 10,
                 cache_dir='features_cache',
                 batch_size=batch_size, # 使用相同的 batch_size
                 shuffle=False, # 验证集不打乱
                 num_workers=0,
                 system_prompt=system_prompt,
-                balance_labels=False # 验证集不使用平衡采样
+                balance_labels=True, # 验证集不使用平衡采样
+                model_path=train_config.model_path
             )
             # 创建验证集 Dataset
             val_dataset = AudioSegmentDataset(
                 data_path=val_config.data_path,
-                encoder=audio_encoder, # 使用相同的 encoder
+                model_path=val_config.model_path,
                 labels_file=val_config.labels_file,
-                max_segments=val_config.max_segments,
-                cache_dir=val_config.cache_dir,
-                system_prompt=val_config.system_prompt
+                cache_dir=val_config.cache_dir
             )
             # 创建验证集 DataLoader
             val_loader = DataLoader(
@@ -671,67 +235,126 @@ class AdaptiveThresholdTrainer:
                 
                 # 提取批次数据并移动到设备
                 # 适配新的dataloader返回格式
-                phone_ids = batch['phone_ids']
-                original_features = [feat.to(self.device) for feat in batch['original_features']]
-                segment_features_list = batch['segment_features']
-                labels = batch['labels'].to(self.device)
-                label_onehots = batch['label_onehots'].to(self.device)
+                segment_features = batch['segment_features'].to(self.device)  # [batch, max_num_segments, max_segment_len, feat_dim]
+                segment_attention_mask = batch['segment_attention_mask'].to(self.device)  # [batch, max_num_segments, max_segment_len]
+                labels = batch['label']  
                 num_segments = batch['num_segments']
+                speakers = batch['speaker']  # 说话者ID列表
                 
-                # 处理图特征和说话人ID - 使用新格式
-                graph_embeddings = None
-                if "speakers" in batch:
-                    speaker_ids = batch['speakers']
-                    # 这里可以添加图模型处理，如果需要
+                # 将字符串标签转换为数值标签（如果需要）
+                numeric_labels = []
+                for label in labels:
+                    if label is None or label == '':
+                        numeric_labels.append(-1)  # 无标签
+                    else:
+                        try:
+                            # 尝试将标签转换为数字
+                            numeric_labels.append(int(label))
+                        except (ValueError, TypeError):
+                            # 如果无法转换为数字，需要维护一个标签映射字典
+                            # 这里简化处理，将所有非数字标签视为0
+                            numeric_labels.append(0)
+                
+                numeric_labels_tensor = torch.tensor(numeric_labels, dtype=torch.long, device=self.device)
+                
+                # 使用图网络处理segment_features
+                try:
+                    # 使用图模型处理segment_features (得到图的嵌入表示)
+                    graph_embedding = self.graph_model(
+                        segment_features,  # [batch, max_num_segments, max_segment_len, feat_dim]
+                        speakers,          # [batch, max_num_segments] 或 List[List]
+                        attention_masks=segment_attention_mask  # [batch, max_num_segments, max_segment_len]
+                    )
+                    
+                    # 图嵌入形状: [batch_size, output_dim]
+                    graph_feature = graph_embedding
+                    
+                except Exception as e:
+                    logger.error(f"图网络处理失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    graph_feature = None
                 
                 # 构建适合模型的输入格式
-                # 这里将原始音频特征和片段特征转换为模型期望的格式
-                
-                # 处理原始音频特征
+                # 优先使用图特征，如果没有则使用原始特征
                 try:
-                    # 构造模型输入 - 可能需要根据模型期望格式调整
-                    original_inputs = {
+                    # 构造模型输入
+                    inputs = {
                         "input_ids": torch.ones(1, 4).long().to(self.device),  # 占位符
                         "attention_mask": torch.ones(1, 4).to(self.device),    # 占位符
-                        "labels": labels                                      # 使用dataloader提供的标签
+                        "labels": numeric_labels_tensor                        # 数值化的标签
                     }
                     
-                    # 如果你的模型需要直接使用特征，添加到inputs中
-                    original_inputs["features"] = original_features[0] if len(original_features) > 0 else None
+                    # 添加图特征
+                    if graph_feature is not None:
+                        inputs["features"] = graph_feature
                     
-                    original_outputs = self.model(**original_inputs)
+                    original_outputs = self.model(**inputs)
                     orig_loss = original_outputs.loss
                     original_loss += orig_loss.item()
                 except Exception as e:
-                    logger.error(f"处理原始音频时出错: {e}")
+                    logger.error(f"模型处理图特征时出错: {e}")
+                    import traceback
+                    traceback.print_exc()
                     orig_loss = torch.tensor(0.0, device=self.device)
                 
-                # 2. 处理音频片段
+                # 2. 处理音频片段特征
                 segments_batch_loss = 0
                 num_valid_segments = 0
                 
-                # 遍历每个样本的所有片段
-                for batch_idx, segments in enumerate(segment_features_list):
-                    for segment_idx, segment_feature in enumerate(segments):
-                        try:
-                            # 将特征移动到设备
-                            segment_feature = segment_feature.to(self.device)
+                # 针对每个批次样本处理片段特征
+                for batch_idx in range(segment_features.size(0)):
+                    # 获取实际有效的片段数
+                    actual_num_segs = num_segments[batch_idx]
+                    
+                    # 使用 get_node_embeddings 获取节点特征
+                    try:
+                        # 提取单个样本的数据
+                        sample_features = segment_features[batch_idx:batch_idx+1]  # [1, max_num_segments, max_segment_len, feat_dim]
+                        sample_mask = segment_attention_mask[batch_idx:batch_idx+1]  # [1, max_num_segments, max_segment_len]
+                        sample_speakers = [speakers[batch_idx]]  # 单个样本的说话者列表
+                        
+                        # 获取节点特征
+                        node_features = self.graph_model.get_node_embeddings(
+                            sample_features,
+                            sample_speakers,
+                            attention_masks=sample_mask
+                        )
+                        # node_features: [max_num_segments, max_segment_len, output_dim]
+                        
+                        # 只处理有效的片段
+                        valid_node_features = node_features[:actual_num_segs]
+                        
+                        # 对每个有效片段进行处理
+                        for seg_idx in range(actual_num_segs):
+                            # 获取当前片段特征并进行平均池化
+                            seg_feature = valid_node_features[seg_idx]  # [max_segment_len, output_dim]
                             
-                            # 构造片段输入
-                            segment_inputs = {
-                                "input_ids": torch.ones(1, 4).long().to(self.device),  # 占位符
-                                "attention_mask": torch.ones(1, 4).to(self.device),    # 占位符
-                                "labels": labels[batch_idx:batch_idx+1],               # 使用对应样本的标签
-                                "features": segment_feature                           # 片段特征
-                            }
-                            
-                            # 前向传播
-                            segment_outputs = self.model(**segment_inputs)
-                            segments_batch_loss += segment_outputs.loss
-                            num_valid_segments += 1
-                        except Exception as e:
-                            logger.error(f"处理音频片段时出错: {e}")
-                            continue
+                            # 使用有效的掩码计算平均值
+                            seg_mask = sample_mask[0, seg_idx].bool()  # [max_segment_len]
+                            if seg_mask.sum() > 0:  # 有有效token
+                                # 使用掩码获取有效的特征并平均
+                                valid_indices = seg_mask.nonzero().squeeze(-1)
+                                valid_features = seg_feature[valid_indices]
+                                segment_embedding = valid_features.mean(dim=0)  # [output_dim]
+                                
+                                # 构造片段输入
+                                segment_inputs = {
+                                    "input_ids": torch.ones(1, 4).long().to(self.device),  # 占位符
+                                    "attention_mask": torch.ones(1, 4).to(self.device),    # 占位符
+                                    "labels": numeric_labels_tensor[batch_idx:batch_idx+1],  # 当前样本的标签
+                                    "features": segment_embedding.unsqueeze(0)  # [1, output_dim]
+                                }
+                                
+                                # 前向传播
+                                segment_outputs = self.model(**segment_inputs)
+                                segments_batch_loss += segment_outputs.loss
+                                num_valid_segments += 1
+                    except Exception as e:
+                        logger.error(f"处理单个样本的节点特征时出错: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
                 
                 # 计算平均片段损失
                 if num_valid_segments > 0:
@@ -843,23 +466,40 @@ class AdaptiveThresholdTrainer:
                 
                 # 提取批次数据并移动到设备 - 适配新的dataloader格式
                 phone_ids = batch['phone_ids']
-                original_features = [feat.to(self.device) for feat in batch['original_features']]
-                labels = batch['labels'].to(self.device)
-                label_onehots = batch['label_onehots'].to(self.device)
+                segment_features = batch['segment_features'].to(self.device)
+                segment_attention_mask = batch['segment_attention_mask'].to(self.device)
+                labels = batch['label']
+                speakers = batch['speaker']
                 
-                # 前向传播
+                # 将字符串标签转换为数值标签
+                numeric_labels = []
+                for label in labels:
+                    if label is None or label == '':
+                        numeric_labels.append(-1)  # 无标签
+                    else:
+                        try:
+                            numeric_labels.append(int(label))
+                        except (ValueError, TypeError):
+                            numeric_labels.append(0)  # 默认0
+                
+                numeric_labels_tensor = torch.tensor(numeric_labels, dtype=torch.long, device=self.device)
+                
+                # 使用图网络处理
                 try:
+                    # 获取图嵌入
+                    graph_embedding = self.graph_model(
+                        segment_features,
+                        speakers,
+                        attention_masks=segment_attention_mask
+                    )
+                    
                     # 构造模型输入
                     inputs = {
-                        "input_ids": torch.ones(len(labels), 4).long().to(self.device),  # 占位符
-                        "attention_mask": torch.ones(len(labels), 4).to(self.device),    # 占位符
-                        "labels": labels
+                        "input_ids": torch.ones(len(numeric_labels), 4).long().to(self.device),  # 占位符
+                        "attention_mask": torch.ones(len(numeric_labels), 4).to(self.device),    # 占位符
+                        "labels": numeric_labels_tensor,  # 当前批次的标签
+                        "features": graph_embedding  # [batch, output_dim]
                     }
-                    
-                    # 如果模型需要直接使用特征，添加到inputs中
-                    for i, feat in enumerate(original_features):
-                        if i == 0:  # 只处理第一个样本，用于示例
-                            inputs["features"] = feat
                     
                     outputs = self.model(**inputs)
                     loss = outputs.loss
@@ -870,9 +510,11 @@ class AdaptiveThresholdTrainer:
                         logits = outputs.logits
                         preds = torch.argmax(logits, dim=-1)
                         all_preds.extend(preds.cpu().numpy())
-                        all_labels.extend(labels.cpu().numpy())
+                        all_labels.extend(numeric_labels_tensor.cpu().numpy())
                 except Exception as e:
                     logger.error(f"评估时处理批次出错: {e}")
+                    import traceback
+                    traceback.print_exc()
                     continue
         
         # 计算平均损失
@@ -952,9 +594,8 @@ def main():
     """主函数"""
     # 添加路径
     sys.path.append('/data/shared/Qwen/ECAI')
-    from qwen2_5_omni_light import Qwen25OmniLightProcessor, Qwen2_5OmniTextOnlyModel
+    from ECAI.qwen2_5_omni_light import Qwen25OmniLightProcessor, Qwen2_5OmniTextOnlyModel
     import torch
-    from qwen_omni_utils import process_mm_info
     
     # 配置参数
     model_path = "/data/shared/Qwen/models/Qwen2.5-Omni-7B"
@@ -970,10 +611,9 @@ def main():
         attn_implementation="flash_attention_2"
     )
     
-    # 更新图模型配置
+    # 更新图模型配置 - 与graph.py匹配的配置
     graph_config = {
         "token_embedding_dim": 768,  # 输入token嵌入维度
-        "hidden_dim": 256,          # 隐藏层维度
         "output_dim": 128,          # 输出维度
         "num_heads": 4,             # 注意力头数量
         "speaker_embedding_dim": 64, # 说话者嵌入维度
@@ -982,7 +622,6 @@ def main():
         "dropout": 0.2,             # Dropout概率
         "similarity_threshold": 0.5,# 相似度阈值
         "context_window_size": 4,   # 上下文窗口大小
-        "aggregation_method": "mean"# 特征聚合方法
     }
     
     output_dir = "./outputs"

@@ -7,7 +7,7 @@ import numpy as np
 class Node:
     """节点类，表示对话中的一个话语"""
     
-    def __init__(self, node_id, utterance_features, speaker_id, timestamp=None):
+    def __init__(self, node_id, utterance_features, speaker_id, timestamp=None, attention_mask=None):
         """
         初始化节点
         
@@ -16,43 +16,19 @@ class Node:
             utterance_features: 话语的多模态融合特征 (可以是一个 (token_num, dim) 的张量)
             speaker_id: 说话者ID
             timestamp: 时间戳，用于保持时序信息
+            attention_mask: 注意力掩码，标记哪些位置是有效的 (token_num,)
         """
         self.id = node_id
         self.utterance_features = utterance_features  # 原始特征，可能是 (token_num, dim)
-        self.aggregated_feature = None # 聚合后的固定维度特征
         self.speaker_id = speaker_id
         self.timestamp = timestamp
         self.embedding = None  # GAT 输出的最终节点嵌入
+        self.attention_mask = attention_mask  # 注意力掩码
     
-    def aggregate_features(self, method='mean'):
-        """将原始特征聚合为固定维度向量"""
-        if isinstance(self.utterance_features, torch.Tensor) and self.utterance_features.ndim == 2:
-            # 如果token_len为1，直接使用而不进行聚合
-            if self.utterance_features.shape[0] == 1:
-                self.aggregated_feature = self.utterance_features.squeeze(0)
-            elif method == 'mean':
-                self.aggregated_feature = torch.mean(self.utterance_features, dim=0)
-            elif method == 'max':
-                self.aggregated_feature = torch.max(self.utterance_features, dim=0)[0]
-            else:
-                 # Default to mean pooling if method unknown
-                 self.aggregated_feature = torch.mean(self.utterance_features, dim=0)
-        elif isinstance(self.utterance_features, torch.Tensor) and self.utterance_features.ndim == 1:
-             self.aggregated_feature = self.utterance_features # Already aggregated
-        else:
-            # Handle cases where aggregation is not applicable or needed
-             self.aggregated_feature = self.utterance_features # Assume it's pre-aggregated
-
     def set_embedding(self, embedding):
         """设置节点的最终嵌入表示"""
         self.embedding = embedding
         
-    def get_aggregated_feature(self):
-        """获取聚合后的节点特征"""
-        if self.aggregated_feature is None:
-            self.aggregate_features() # Perform default aggregation if not done yet
-        return self.aggregated_feature
-
     def get_embedding(self):
         """获取节点的嵌入表示"""
         return self.embedding
@@ -305,7 +281,7 @@ class DialogueGraph:
                     # 源节点 j 可以是用户或客服
                     edge = Edge(nodes_list[j].id, nodes_list[i].id, Edge.CROSS_TURN_EDGE)
                     self.add_edge(edge)
-                    # # (可选) 添加反向边 i -> j
+                    # # # (可选) 添加反向边 i -> j
                     # edge_rev = Edge(nodes_list[i].id, nodes_list[j].id, Edge.CROSS_TURN_EDGE)
                     # self.add_edge(edge_rev)
 
@@ -363,12 +339,12 @@ class DialogueGraph:
         return edge_index, edge_type, node_id_to_idx, sorted_node_ids
 
 
-class MultiHeadAttention(nn.Module):
-    """使用PyTorch官方nn.MultiheadAttention实现的图注意力机制"""
+class MultiHeadAttentionWithMask(nn.Module):
+    """支持直接处理变长序列特征和掩码的多头注意力机制"""
     
     def __init__(self, dim, num_heads, dropout=0.2, num_edge_types=4):
         """
-        初始化多头注意力模块
+        初始化支持掩码的多头注意力模块
         
         参数:
             dim: 特征维度 (输入输出维度相同)
@@ -376,7 +352,7 @@ class MultiHeadAttention(nn.Module):
             dropout: Dropout概率
             num_edge_types: 边类型的数量，默认为4
         """
-        super(MultiHeadAttention, self).__init__()
+        super(MultiHeadAttentionWithMask, self).__init__()
         
         # 确保dim可被num_heads整除
         if dim % num_heads != 0:
@@ -393,46 +369,40 @@ class MultiHeadAttention(nn.Module):
         # 初始化为全1，表示所有边类型初始时具有相同的重要性
         self.edge_type_weights = nn.Parameter(torch.ones(num_edge_types))
         
+        # 层归一化
+        self.layer_norm = nn.LayerNorm(dim)
+        
         # 投影层 - 保持输入输出维度相同
         self.q_proj = nn.Linear(dim, dim)
         self.k_proj = nn.Linear(dim, dim)
         self.v_proj = nn.Linear(dim, dim)
+        self.o_proj = nn.Linear(dim, dim)
         
-        # 使用PyTorch官方的多头注意力实现
-        self.attn = nn.MultiheadAttention(
-            embed_dim=dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # Dropout层用于输出
+        # Dropout层
         self.dropout_layer = nn.Dropout(dropout)
         
-    def forward(self, x, edge_index, edge_type=None):
+    def forward(self, node_features, node_masks, edge_index, edge_type=None):
         """
-        前向传播
+        前向传播，直接处理变长序列特征和掩码
         
         参数:
-            x: 节点特征矩阵 [num_nodes, dim] (聚合后的特征)
+            node_features: 节点原始特征列表 [num_nodes, max_seq_len, dim]
+            node_masks: 节点特征掩码 [num_nodes, max_seq_len]
             edge_index: 边索引 [2, num_edges]
-            edge_type: 边类型 [num_edges]如果为None则所有边被视为相同类型
+            edge_type: 边类型 [num_edges]，如果为None则所有边被视为相同类型
             
         返回:
-            输出特征矩阵 [num_nodes, dim]
+            更新后的节点特征 [num_nodes, max_seq_len, dim]
         """
-        num_nodes = x.size(0)
+        num_nodes, max_seq_len, hidden_dim = node_features.size()
+        device = node_features.device
+        
         if num_nodes == 0 or edge_index.numel() == 0:
             # 处理空图或无边的情况
-            return torch.zeros(num_nodes, self.dim, device=x.device)
-            
-        # 投影查询、键和值
-        query = self.q_proj(x).unsqueeze(0)  # [1, num_nodes, dim]
-        key = self.k_proj(x).unsqueeze(0)    # [1, num_nodes, dim]
-        value = self.v_proj(x).unsqueeze(0)  # [1, num_nodes, dim]
+            return torch.zeros_like(node_features)
         
-        # 构建基础注意力掩码（所有位置初始化为-inf，表示不允许注意力）
-        attn_mask = torch.full((num_nodes, num_nodes), float('-inf'), device=x.device)
+        # 构建图的邻接矩阵 (带边类型权重)
+        adj_matrix = torch.full((num_nodes, num_nodes), float('-inf'), device=device)
         
         src_nodes, dst_nodes = edge_index
         
@@ -442,176 +412,144 @@ class MultiHeadAttention(nn.Module):
                 src, dst = src_nodes[i], dst_nodes[i]
                 # 获取边类型（从1开始），减1作为索引（从0开始）
                 e_type_idx = edge_type[i].item() - 1
-                # 使用softplus确保权重为正数，更稳定地学习
-                weight = F.softplus(self.edge_type_weights[e_type_idx])
-                # 应用边权重作为初始注意力得分
-                attn_mask[src, dst] = weight
+                # 使用softplus确保权重为正数，并确保稳定性
+                weight = F.softplus(self.edge_type_weights[e_type_idx]).clamp(min=1e-6, max=1e6)
+                # 应用边权重作为邻接矩阵中的值
+                adj_matrix[src, dst] = weight
         else:
-            # 如果没有提供边类型，所有边使用相同的权重（设为1，即log(e)）
-            attn_mask[src_nodes, dst_nodes] = 1.0
-            
-        # 添加自环（如果未在edge_index中明确包含）
-        for i in range(num_nodes):
-            if attn_mask[i, i] == float('-inf'):  # 确保自环不会覆盖已有的边
-                # 如果提供了边类型，使用自环边类型权重（通常是类型4）
-                if edge_type is not None:
-                    self_loop_type_idx = 3  # 自环边是类型4，索引为3
-                    weight = F.softplus(self.edge_type_weights[self_loop_type_idx])
-                    attn_mask[i, i] = weight
-                else:
-                    attn_mask[i, i] = 1.0
-            
-        # 应用多头注意力
-        output, _ = self.attn(
-            query=query,           # [1, num_nodes, dim]
-            key=key,               # [1, num_nodes, dim]
-            value=value,           # [1, num_nodes, dim]
-            attn_mask=attn_mask,   # [num_nodes, num_nodes]
-            need_weights=False     # 不需要返回注意力权重
-        )
+            # 如果没有提供边类型，所有边使用相同的权重
+            adj_matrix[src_nodes, dst_nodes] = 1.0
         
-        # 删除批次维度并应用dropout
-        output = output.squeeze(0)  # [num_nodes, dim]
+        # 应用层归一化
+        normed_features = self.layer_norm(node_features)
+        
+        # 计算查询、键和值
+        q = self.q_proj(normed_features)  # [num_nodes, max_seq_len, dim]
+        k = self.k_proj(normed_features)  # [num_nodes, max_seq_len, dim]
+        v = self.v_proj(normed_features)  # [num_nodes, max_seq_len, dim]
+        
+        # 重塑为多头形式 - 使用reshape替代view
+        head_dim = self.dim // self.num_heads
+        q = q.reshape(num_nodes, max_seq_len, self.num_heads, head_dim).permute(0, 2, 1, 3)  # [num_nodes, num_heads, max_seq_len, head_dim]
+        k = k.reshape(num_nodes, max_seq_len, self.num_heads, head_dim).permute(0, 2, 1, 3)  # [num_nodes, num_heads, max_seq_len, head_dim]
+        v = v.reshape(num_nodes, max_seq_len, self.num_heads, head_dim).permute(0, 2, 1, 3)  # [num_nodes, num_heads, max_seq_len, head_dim]
+        
+        # 获取每个节点的有效 token 数量 (用于后续计算)
+        valid_tokens_per_node = node_masks.sum(dim=1).long()  # [num_nodes]
+        
+        # 创建输出特征张量，初始化为零
+        # 形状: [num_nodes, num_heads, max_seq_len, head_dim]
+        output_features = torch.zeros_like(q)
+        
+        # 对每个节点单独计算 attention
+        for i in range(num_nodes):
+            # 跳过填充节点 (如果存在)
+            if valid_tokens_per_node[i] == 0:
+                continue
+                
+            # 获取当前节点的查询表示和掩码
+            # 只保留有效的 token (由掩码确定)
+            query_node_mask = node_masks[i]  # [max_seq_len]
+            query_valid_len = valid_tokens_per_node[i]
+            
+            # 对于该节点，收集所有相连节点的信息
+            attending_nodes = []
+            edge_weights = []
+            
+            # 找出所有与节点i相连的节点 (边i->j存在)
+            for j in range(num_nodes):
+                if adj_matrix[i, j] != float('-inf'):
+                    attending_nodes.append(j)
+                    edge_weights.append(adj_matrix[i, j])
+            
+            if not attending_nodes:
+                continue  # 如果没有相连节点，跳过
+                
+            # 将列表转换为张量，方便操作
+            attending_nodes = torch.tensor(attending_nodes, device=device)
+            edge_weights = torch.tensor(edge_weights, device=device)
+            
+            # 获取所有相连节点的键和值向量
+            # 形状: [num_attending, num_heads, max_seq_len, head_dim]
+            keys_attending = k[attending_nodes]
+            values_attending = v[attending_nodes]
+            
+            # 获取相连节点的掩码
+            # 形状: [num_attending, max_seq_len]
+            masks_attending = node_masks[attending_nodes]
+            
+            # 计算节点i对所有相连节点的注意力分数
+            # 为每个头单独计算
+            for h in range(self.num_heads):
+                # 当前节点在当前头的查询向量 [max_seq_len, head_dim]
+                query_head = q[i, h]  
+                
+                # 仅对有效token计算注意力
+                valid_query_head = query_head[:query_valid_len]  # [valid_len, head_dim]
+                
+                # 存储对所有相连节点的注意力值
+                num_attending = len(attending_nodes)
+                
+                # 对每个相连的节点j
+                for idx, j in enumerate(attending_nodes):
+                    # 获取节点j的有效token数
+                    key_node_mask = masks_attending[idx]  # [max_seq_len]
+                    key_valid_len = key_node_mask.sum().long()
+                    
+                    if key_valid_len == 0:
+                        continue  # 跳过没有有效token的节点
+                    
+                    # 获取当前相连节点的键向量 - 仅有效部分
+                    key_head = keys_attending[idx, h]  # [max_seq_len, head_dim]
+                    valid_key_head = key_head[:key_valid_len]  # [valid_len_j, head_dim]
+                    
+                    # 计算该节点对的注意力分数 [valid_len_i, valid_len_j]
+                    scores = torch.matmul(valid_query_head, valid_key_head.transpose(0, 1)) / (head_dim ** 0.5)
+                    
+                    # 加上边权重 (为所有score加上相同的偏置)
+                    scores = scores + edge_weights[idx]
+                    
+                    # 对每个查询位置的分数进行softmax - 关键修改点!
+                    # 这样每个有效的查询token只会关注有效的键token
+                    attn_weights = F.softmax(scores, dim=1)  # [valid_len_i, valid_len_j]
+                    
+                    # 对噪声处理
+                    attn_weights = torch.nan_to_num(attn_weights, nan=0.0, posinf=0.0, neginf=0.0)
+                    
+                    # 获取当前相连节点的值向量 - 仅有效部分
+                    value_head = values_attending[idx, h]  # [max_seq_len, head_dim]
+                    valid_value_head = value_head[:key_valid_len]  # [valid_len_j, head_dim]
+                    
+                    # 计算加权值 [valid_len_i, head_dim]
+                    weighted_values = torch.matmul(attn_weights, valid_value_head)
+                    
+                    # 将计算结果回填到输出特征中 (保持填充部分为零)
+                    output_features[i, h, :query_valid_len] += weighted_values
+            
+        # 重塑回原始形状
+        output_features = output_features.permute(0, 2, 1, 3).contiguous()  # [num_nodes, max_seq_len, num_heads, head_dim]
+        output_features = output_features.reshape(num_nodes, max_seq_len, self.dim)  # [num_nodes, max_seq_len, dim]
+        
+        # 应用输出投影
+        output = self.o_proj(output_features)
         output = self.dropout_layer(output)
+        
+        # 应用残差连接
+        output = output + node_features
+        
+        # 确保填充位置保持为0 (使用精确的掩码机制)
+        output = output * node_masks.unsqueeze(-1).float()
         
         return output
 
 
-# class DebugMultiHeadAttention(nn.Module):
-#     """调试版本的多头注意力机制，返回注意力权重用于分析"""
-    
-#     def __init__(self, dim, num_heads, dropout=0.2, num_edge_types=4):
-#         """
-#         初始化调试版本多头注意力模块
-        
-#         参数:
-#             dim: 特征维度 (输入输出维度相同)
-#             num_heads: 注意力头数量
-#             dropout: Dropout概率
-#             num_edge_types: 边类型的数量，默认为4
-#         """
-#         super(DebugMultiHeadAttention, self).__init__()
-        
-#         # 确保dim可被num_heads整除
-#         if dim % num_heads != 0:
-#             print(f"Warning: dim ({dim}) not divisible by num_heads ({num_heads}). Adjusting dim.")
-#             dim = (dim // num_heads) * num_heads
-#             if dim == 0:
-#                 raise ValueError("dim becomes 0 after adjustment.")
-        
-#         self.dim = dim
-#         self.num_heads = num_heads
-#         self.num_edge_types = num_edge_types
-        
-#         # 为每种边类型添加可学习的权重参数
-#         self.edge_type_weights = nn.Parameter(torch.ones(num_edge_types))
-        
-#         # 投影层 - 保持输入输出维度相同
-#         self.q_proj = nn.Linear(dim, dim)
-#         self.k_proj = nn.Linear(dim, dim)
-#         self.v_proj = nn.Linear(dim, dim)
-        
-#         # 多头注意力
-#         self.attn = nn.MultiheadAttention(
-#             embed_dim=dim,
-#             num_heads=num_heads,
-#             dropout=dropout,
-#             batch_first=True
-#         )
-        
-#         self.dropout_layer = nn.Dropout(dropout)
-        
-#     def forward(self, x, edge_index, edge_type=None, return_attention=True):
-#         """
-#         前向传播，返回节点表示和注意力权重
-        
-#         参数:
-#             x: 节点特征矩阵 [num_nodes, dim]
-#             edge_index: 边索引 [2, num_edges]
-#             edge_type: 边类型 [num_edges]
-#             return_attention: 是否返回注意力权重
-            
-#         返回:
-#             output: 输出特征矩阵 [num_nodes, dim]
-#             attn_weights: 注意力权重 [batch_size, num_nodes, num_nodes]
-#             edge_weights: 边类型权重 [num_edge_types]
-#             attn_mask: 注意力掩码矩阵 [num_nodes, num_nodes]
-#         """
-#         num_nodes = x.size(0)
-#         if num_nodes == 0 or edge_index.numel() == 0:
-#             if return_attention:
-#                 return (torch.zeros(num_nodes, self.dim, device=x.device), 
-#                         None, self.edge_type_weights, None)
-#             else:
-#                 return torch.zeros(num_nodes, self.dim, device=x.device)
-            
-#         # 投影查询、键和值
-#         query = self.q_proj(x).unsqueeze(0)  # [1, num_nodes, dim]
-#         key = self.k_proj(x).unsqueeze(0)    # [1, num_nodes, dim]
-#         value = self.v_proj(x).unsqueeze(0)  # [1, num_nodes, dim]
-        
-#         # 构建注意力掩码
-#         attn_mask = torch.full((num_nodes, num_nodes), float('-inf'), device=x.device)
-        
-#         src_nodes, dst_nodes = edge_index
-        
-#         # 创建一个字典记录边类型到权重的映射，用于调试
-#         edge_type_to_weight = {}
-        
-#         if edge_type is not None:
-#             # 使用边类型权重
-#             for i in range(edge_index.shape[1]):
-#                 src, dst = src_nodes[i], dst_nodes[i]
-#                 e_type_idx = edge_type[i].item() - 1
-#                 weight = F.softplus(self.edge_type_weights[e_type_idx])
-#                 attn_mask[src, dst] = weight
-                
-#                 # 记录边类型到权重的映射
-#                 if e_type_idx not in edge_type_to_weight:
-#                     edge_type_to_weight[e_type_idx] = weight.item()
-#         else:
-#             attn_mask[src_nodes, dst_nodes] = 1.0
-            
-#         # 添加自环
-#         for i in range(num_nodes):
-#             if attn_mask[i, i] == float('-inf'):
-#                 if edge_type is not None:
-#                     self_loop_type_idx = 3  # 自环边类型索引
-#                     weight = F.softplus(self.edge_type_weights[self_loop_type_idx])
-#                     attn_mask[i, i] = weight
-                    
-#                     # 记录自环边权重
-#                     if self_loop_type_idx not in edge_type_to_weight:
-#                         edge_type_to_weight[self_loop_type_idx] = weight.item()
-#                 else:
-#                     attn_mask[i, i] = 1.0
-            
-#         # 应用多头注意力，返回注意力权重
-#         output, attn_weights = self.attn(
-#             query=query,
-#             key=key,
-#             value=value,
-#             attn_mask=attn_mask,
-#             need_weights=return_attention
-#         )
-        
-#         output = output.squeeze(0)
-#         output = self.dropout_layer(output)
-        
-#         if return_attention:
-#             edge_weights = {t+1: edge_type_to_weight[t] for t in edge_type_to_weight}
-#             return output, attn_weights, edge_weights, attn_mask
-#         else:
-#             return output
-
-
-class GraphAttentionNetwork(nn.Module):
-    """图注意力网络，用于对话图的节点表示学习"""
+class GraphAttentionNetworkWithMask(nn.Module):
+    """支持直接处理变长序列特征和掩码的图注意力网络"""
     
     def __init__(self, dim, num_heads, speaker_embedding_dim=None, 
                  num_speakers=None, num_layers=2, dropout=0.2):
         """
-        初始化图注意力网络
+        初始化支持掩码的图注意力网络
         
         参数:
             dim: 特征维度 (输入输出维度相同)
@@ -621,7 +559,7 @@ class GraphAttentionNetwork(nn.Module):
             num_layers: 图注意力层数量
             dropout: Dropout概率
         """
-        super(GraphAttentionNetwork, self).__init__()
+        super(GraphAttentionNetworkWithMask, self).__init__()
         
         # 确保dim可被num_heads整除
         if dim % num_heads != 0:
@@ -638,66 +576,74 @@ class GraphAttentionNetwork(nn.Module):
         # 若未指定speaker_embedding_dim，则设为与节点特征维度相同
         if speaker_embedding_dim is None:
             speaker_embedding_dim = dim
+        
+        self.speaker_embedding_dim = speaker_embedding_dim
 
         # 说话者嵌入层
         self.speaker_embedding = SpeakerEmbedding(speaker_embedding_dim, num_speakers)
         
-        # 注意：现在说话人嵌入维度与节点特征维度相同，因此传入投影层的是双倍维度
-        combined_dim = dim + speaker_embedding_dim
-
-        # 输入特征投影 (将合并的特征投影回原始维度)
-        self.input_projection = nn.Linear(combined_dim, dim)
-
-        # 图注意力层 - 所有层使用相同的输入输出维度
+        # 新增：添加特征拼接后的投影层，将拼接后的特征映射回原始维度
+        self.concat_projection = nn.Linear(dim + speaker_embedding_dim, dim)
+        
+        # 图注意力层
         self.gat_layers = nn.ModuleList()
         for _ in range(num_layers):
             self.gat_layers.append(
-                MultiHeadAttention(dim, num_heads, dropout)
+                MultiHeadAttentionWithMask(dim, num_heads, dropout)
             )
 
-        self.dropout_layer = nn.Dropout(dropout)  # 用于层间
+        self.dropout_layer = nn.Dropout(dropout)
         self.activation = nn.ELU()
 
-    def forward(self, aggregated_x, speaker_ids, edge_index, edge_type=None):
+    def forward(self, node_features, node_masks, speaker_ids, edge_index, edge_type=None):
         """
         前向传播
         
         参数:
-            aggregated_x: 聚合后的话语特征矩阵 [num_nodes, dim]
+            node_features: 节点特征 [num_nodes, max_seq_len, dim]
+            node_masks: 节点特征掩码 [num_nodes, max_seq_len]
             speaker_ids: 说话者ID [num_nodes]
             edge_index: 边索引 [2, num_edges]
             edge_type: 边类型 [num_edges]，如果为None则所有边被视为相同类型
             
         返回:
-            节点的最终表示 [num_nodes, dim]
+            处理后的节点特征 [num_nodes, max_seq_len, dim]
         """
-        # 1. 计算说话者嵌入
+        num_nodes, max_seq_len, _ = node_features.size()
+        device = node_features.device
+        
+        # 获取说话者嵌入
         speaker_emb = self.speaker_embedding(speaker_ids)  # [num_nodes, speaker_embedding_dim]
-
-        # 2. 拼接聚合特征和说话者嵌入
-        x = torch.cat([aggregated_x, speaker_emb], dim=1)  # [num_nodes, dim + speaker_embedding_dim]
-
-        # 3. 投影到隐藏维度
-        x = self.input_projection(x)  # [num_nodes, dim]
-        # 应用激活函数和dropout，在第一个GAT层之前
-        x = self.activation(x)
-        x = self.dropout_layer(x)
-
-        # 4. 应用图注意力层
+        
+        # 将说话者嵌入扩展到与节点特征相同的序列长度
+        speaker_emb = speaker_emb.unsqueeze(1).expand(-1, max_seq_len, -1)  # [num_nodes, max_seq_len, speaker_embedding_dim]
+        
+        # 新增：将说话者嵌入与节点特征拼接
+        combined_features = torch.cat([node_features, speaker_emb], dim=-1)  # [num_nodes, max_seq_len, dim + speaker_embedding_dim]
+        
+        # 新增：投影回原始维度
+        x = self.concat_projection(combined_features)  # [num_nodes, max_seq_len, dim]
+        
+        # 应用多层图注意力
         for i, gat_layer in enumerate(self.gat_layers):
-            x = gat_layer(x, edge_index, edge_type)  # 传递边类型
-            # 在GAT层之间应用激活函数和dropout（不在最后一层之后）
+            # 应用GAT层
+            x = gat_layer(x, node_masks, edge_index, edge_type)
+            
+            # 在层之间应用激活函数和dropout（不在最后一层之后）
             if i < self.num_layers - 1:
-                 x = self.activation(x)
-                 x = self.dropout_layer(x)
-
+                x = self.activation(x)
+                x = self.dropout_layer(x)
+        
+        # 确保掩码得到应用
+        x = x * node_masks.unsqueeze(-1)
+        
         return x
 
 
 class DialogueGraphBuilder:
     """对话图构建器，负责从原始对话数据构建对话图结构（边）"""
     
-    def __init__(self, similarity_threshold=0.5, context_window_size=4):
+    def __init__(self, similarity_threshold=0.9, context_window_size=3):
         """
         初始化对话图构建器
         
@@ -708,34 +654,54 @@ class DialogueGraphBuilder:
         self.similarity_threshold = similarity_threshold
         self.context_window_size = context_window_size
 
-    def compute_similarity_matrix(self, aggregated_node_features):
+    def compute_masked_similarity_matrix(self, features, masks):
         """
-        计算节点间的相似度矩阵 (使用聚合后的特征)
+        使用掩码计算节点间的相似度矩阵
         
         参数:
-            aggregated_node_features: 聚合后的节点特征张量 [N, agg_dim]
+            features: 节点特征 [num_nodes, max_seq_len, dim]
+            masks: 节点掩码 [num_nodes, max_seq_len]
             
         返回:
-            相似度矩阵 [N, N]
+            相似度矩阵 [num_nodes, num_nodes]
         """
-        if aggregated_node_features is None or aggregated_node_features.nelement() == 0:
-             # Return an empty matrix or a matrix of appropriate size with zeros/NaNs
-             num_nodes = 0 # Or determine from context if possible
-             if aggregated_node_features is not None:
-                  num_nodes = aggregated_node_features.shape[0]
-             return np.zeros((num_nodes, num_nodes))
-
-
-        # 归一化特征
-        normalized_features = F.normalize(aggregated_node_features, p=2, dim=1)
-
+        num_nodes, max_seq_len, dim = features.size()
+        device = features.device
+        
+        if num_nodes == 0:
+            return torch.zeros((0, 0), device=device)
+        
+        # 扩展掩码为 [num_nodes, max_seq_len, 1]
+        expanded_masks = masks.unsqueeze(-1).float()
+        
+        # 计算每个节点的平均特征向量 (用于相似度计算)
+        # [num_nodes, dim]
+        mask_sum = masks.sum(dim=1, keepdim=True).clamp(min=1.0)  # 防止除零
+        avg_features = (features * expanded_masks).sum(dim=1) / mask_sum
+        
+        # 防止特征全零导致的NaN
+        zero_features = torch.all(avg_features == 0, dim=1, keepdim=True)
+        if zero_features.any():
+            # 为全零特征添加一个小的噪声以避免NaN
+            noise = torch.randn_like(avg_features) * 1e-6
+            avg_features = torch.where(zero_features, noise, avg_features)
+        
+        # 归一化特征，防止零向量
+        feature_norms = torch.norm(avg_features, p=2, dim=1, keepdim=True)
+        # 避免除以零
+        feature_norms = torch.clamp(feature_norms, min=1e-8)
+        normalized_features = avg_features / feature_norms
+        
         # 计算余弦相似度
         similarity_matrix = torch.mm(normalized_features, normalized_features.t())
-
-        # Clamp values to avoid potential numerical issues if needed
+        
+        # 检查并修复NaN值
+        similarity_matrix = torch.nan_to_num(similarity_matrix, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        # 限制值在 [-1, 1] 范围内
         similarity_matrix = torch.clamp(similarity_matrix, min=-1.0, max=1.0)
-
-        return similarity_matrix.cpu().numpy() # Return numpy array as before
+        
+        return similarity_matrix
 
     def build_graph_structure(self, num_nodes, speaker_ids_list, timestamps=None):
         """
@@ -751,15 +717,13 @@ class DialogueGraphBuilder:
         """
         graph = DialogueGraph()
 
-        # 创建节点 (此时特征可以是 None 或 原始特征，聚合特征在模型中处理)
+        # 创建节点 (此时特征可以是 None 或 原始特征)
         if timestamps is None:
             timestamps = list(range(num_nodes))
         elif len(timestamps) != num_nodes:
              raise ValueError(f"Length of timestamps ({len(timestamps)}) must match num_nodes ({num_nodes})")
 
-
         for i in range(num_nodes):
-            # utterance_features can be set later or kept as None if only structure is needed here
             node = Node(node_id=i, utterance_features=None, speaker_id=speaker_ids_list[i], timestamp=timestamps[i])
             graph.add_node(node)
 
@@ -772,7 +736,7 @@ class DialogueGraphBuilder:
         # 构建自环边 (Type 4)
         graph.build_self_loop_edges()
 
-        # 注意：跨轮次边 (Type 3) 在 DialogueGraphModel.forward 中构建，因为它需要聚合特征
+        # 注意：跨轮次边 (Type 3) 在 DialogueGraphModel.forward 中构建，因为它需要特征信息
 
         return graph
 
@@ -780,15 +744,14 @@ class DialogueGraphBuilder:
 class DialogueGraphModel(nn.Module):
     """对话图模型，集成图注意力网络和其他组件"""
     
-    def __init__(self, token_embedding_dim, hidden_dim=None, output_dim=None, num_heads=4,
+    def __init__(self, token_embedding_dim, output_dim=None, num_heads=4,
                  speaker_embedding_dim=None, num_speakers=None, num_layers=2, dropout=0.2,
-                 similarity_threshold=0.5, context_window_size=3, aggregation_method='mean'):
+                 similarity_threshold=0.8, context_window_size=3):
         """
         初始化对话图模型
         
         参数:
-            token_embedding_dim: 输入的 token 嵌入维度 (聚合后的维度将与此相同)
-            hidden_dim: GAT 隐藏层维度, 如果为None则设置为 2*token_embedding_dim
+            token_embedding_dim: 输入的 token 嵌入维度
             output_dim: GAT 输出特征维度, 如果为None则设置为等于 token_embedding_dim 以保持维度不变
             num_heads: 注意力头数量
             speaker_embedding_dim: 说话者嵌入维度，若为None则设为等于token_embedding_dim
@@ -797,16 +760,10 @@ class DialogueGraphModel(nn.Module):
             dropout: Dropout概率
             similarity_threshold: 相似度阈值 (初始值，可以设为可学习)
             context_window_size: 上下文窗口大小
-            aggregation_method: 'mean' or 'max' for aggregating token embeddings
         """
         super(DialogueGraphModel, self).__init__()
 
-        self.aggregation_method = aggregation_method
         self.token_embedding_dim = token_embedding_dim
-        
-        # 如果未指定hidden_dim，默认设为token_embedding_dim的2倍
-        if hidden_dim is None:
-            hidden_dim = 2 * token_embedding_dim
             
         # 如果未指定output_dim，默认设为等于token_embedding_dim
         if output_dim is None:
@@ -816,27 +773,25 @@ class DialogueGraphModel(nn.Module):
         if speaker_embedding_dim is None:
             speaker_embedding_dim = token_embedding_dim
             
-        # 确保hidden_dim和output_dim可以被num_heads整除
-        if hidden_dim % num_heads != 0:
-            print(f"Warning: Adjusting hidden_dim from {hidden_dim} to be divisible by num_heads ({num_heads})")
-            hidden_dim = (hidden_dim // num_heads) * num_heads
-            
+        # 确保token_embedding_dim可以被num_heads整除
+        gat_dim = token_embedding_dim
+        if gat_dim % num_heads != 0:
+            print(f"Warning: token_embedding_dim ({token_embedding_dim}) not divisible by num_heads ({num_heads}). Adjusting dim.")
+            gat_dim = (gat_dim // num_heads) * num_heads
+            if gat_dim == 0:
+                gat_dim = num_heads
+                print(f"Warning: dimension was adjusted to minimum value: {gat_dim}")
+                
         if output_dim % num_heads != 0:
             print(f"Warning: Adjusting output_dim from {output_dim} to be divisible by num_heads ({num_heads})")
             output_dim = (output_dim // num_heads) * num_heads
-            
-        # 确保调整后的dimensions不为0
-        if hidden_dim == 0:
-            hidden_dim = num_heads  # 最小可能值
-            print(f"Warning: hidden_dim was adjusted to minimum value: {hidden_dim}")
-            
-        if output_dim == 0:
-            output_dim = num_heads  # 最小可能值
-            print(f"Warning: output_dim was adjusted to minimum value: {output_dim}")
+            if output_dim == 0:
+                output_dim = num_heads
+                print(f"Warning: output_dim was adjusted to minimum value: {output_dim}")
 
-        # 图注意力网络 (使用正确的参数调用GraphAttentionNetwork)
-        self.gat = GraphAttentionNetwork(
-            dim=hidden_dim,  # 使用hidden_dim作为GAT的dim参数
+        # 使用支持掩码的图注意力网络
+        self.gat = GraphAttentionNetworkWithMask(
+            dim=gat_dim,
             num_heads=num_heads,
             speaker_embedding_dim=speaker_embedding_dim,
             num_speakers=num_speakers,
@@ -846,181 +801,232 @@ class DialogueGraphModel(nn.Module):
 
         # 对话图构建器 (用于构图逻辑)
         self.graph_builder = DialogueGraphBuilder(
-            similarity_threshold=similarity_threshold, # Initial value
+            similarity_threshold=similarity_threshold,
             context_window_size=context_window_size
         )
 
-        # 可学习的相似度阈值 (可选)
-        # self.similarity_threshold = nn.Parameter(torch.tensor(similarity_threshold))
-        self.similarity_threshold_value = similarity_threshold # Use fixed threshold for now
+        self.similarity_threshold_value = similarity_threshold
         
         # 存储初始化参数，方便使用
-        self.hidden_dim = hidden_dim
+        self.hidden_dim = gat_dim
         self.output_dim = output_dim
+        
+        # 如果GAT使用的维度与输入不同，添加初始调整
+        if gat_dim != token_embedding_dim:
+            self.dim_adjust = nn.Linear(token_embedding_dim, gat_dim)
+        else:
+            self.dim_adjust = nn.Identity()
+        
+        # 输出投影层 - 将GAT输出投影回output_dim（如果需要）
+        if gat_dim != output_dim:
+            self.output_projection = nn.Linear(gat_dim, output_dim)
+        else:
+            self.output_projection = nn.Identity()
 
-    def _aggregate_features(self, features_list, device):
-        """Helper function to aggregate list of (tok_num, dim) tensors."""
-        aggregated = []
-        if not features_list: # Handle empty input list
-            return torch.empty((0, self.token_embedding_dim), device=device)
-
-        for i, feat in enumerate(features_list):
-            if isinstance(feat, torch.Tensor):
-                feat = feat.to(device) # Move to device
-                if feat.ndim == 2 and feat.shape[0] > 0: # Check if it's (token_num, dim) and not empty
-                    if self.aggregation_method == 'mean':
-                        agg = torch.mean(feat, dim=0)
-                    elif self.aggregation_method == 'max':
-                        agg = torch.max(feat, dim=0)[0]
-                    else:
-                        agg = torch.mean(feat, dim=0) # Default
-                    aggregated.append(agg)
-                elif feat.ndim == 1: # Assume already aggregated
-                     if feat.shape[0] == self.token_embedding_dim:
-                         aggregated.append(feat)
-                     else:
-                         print(f"Warning: Node {i} feature tensor is 1D but has wrong dimension ({feat.shape[0]} vs {self.token_embedding_dim}). Using zero vector.")
-                         aggregated.append(torch.zeros(self.token_embedding_dim, device=device))
-                else: # Handle empty tensor (shape[0]==0) or unexpected dims
-                     aggregated.append(torch.zeros(self.token_embedding_dim, device=device))
-                     print(f"Warning: Node {i} feature tensor had unexpected shape {feat.shape} or was empty. Using zero vector.")
-            else:
-                 # Handle non-tensor input
-                 aggregated.append(torch.zeros(self.token_embedding_dim, device=device))
-                 print(f"Warning: Node {i} feature was not a tensor ({type(feat)}). Using zero vector.")
-
-        # Stack the aggregated features
-        if not aggregated: # Should not happen if features_list is not empty, but as safeguard
-             return torch.empty((0, self.token_embedding_dim), device=device)
-
-        return torch.stack(aggregated) # [num_nodes, token_embedding_dim]
-
-    def forward(self, utterance_features_input, speaker_ids_input, edge_index=None, edge_type=None):
+    def forward(self, utterance_features_input, speaker_ids_input, attention_masks=None, edge_index=None, edge_type=None):
         """
-        前向传播
+        前向传播，直接处理变长序列特征和掩码
         
         参数:
-            utterance_features_input:
-                - List of Tensors: [(token_num_1, dim), (token_num_2, dim), ...] (for batch_size=1, auto-graph build)
-                - Tensor: [batch_size * seq_len, dim] (if features are pre-aggregated and graph is provided)
-            speaker_ids_input:
-                - List or Tensor: [seq_len] (for batch_size=1, auto-graph build)
-                - Tensor: [batch_size * seq_len] (if graph is provided)
+            utterance_features_input: 节点特征 [batch_size, max_num_segments, max_segment_len, feat_dim]
+            speaker_ids_input: 说话者ID [batch_size, max_num_segments] 或 List[List[int/str]]
+            attention_masks: 注意力掩码 [batch_size, max_num_segments, max_segment_len]
             edge_index: 预定义的边索引 [2, num_edges], 如果为None则自动构建图 (仅支持 batch_size=1)
             edge_type: 预定义的边类型 [num_edges], 如果为None则自动构建图 (仅支持 batch_size=1)
             
         返回:
-            节点 GAT 输出嵌入:
-                - [1, seq_len, output_dim] (if batch_size=1, auto-graph build)
-                - [N, output_dim] (if graph is provided, N = batch_size * seq_len, needs reshaping by caller)
+            更新后的节点特征 [batch_size, max_num_segments, max_segment_len, output_dim]
         """
-        device = next(self.parameters()).device # Get model's device
+        device = next(self.parameters()).device
 
-        # --- Case 1: Auto-build graph (expects batch_size=1 and list input) ---
-        if edge_index is None or edge_type is None:
-            # --- Input Validation ---
-            if not isinstance(utterance_features_input, list):
-                raise ValueError("For automatic graph building (edge_index is None), utterance_features_input must be a list of tensors.")
-            if isinstance(speaker_ids_input, torch.Tensor):
-                if speaker_ids_input.ndim > 1 or speaker_ids_input.shape[0] != len(utterance_features_input):
-                    raise ValueError(f"Speaker_ids tensor shape ({speaker_ids_input.shape}) incompatible with feature list length ({len(utterance_features_input)}). Expected [seq_len].")
-                speaker_ids_list_int = speaker_ids_input.cpu().tolist() # For graph builder - 不转换为long
-                speaker_ids_tensor = speaker_ids_input.to(device) # For GAT - 不转换为long
-            elif isinstance(speaker_ids_input, list):
-                 if len(speaker_ids_input) != len(utterance_features_input):
-                     raise ValueError(f"speaker_ids list length ({len(speaker_ids_input)}) must match utterance_features list length ({len(utterance_features_input)}).")
-                 speaker_ids_list_int = speaker_ids_input # For graph builder
-                 speaker_ids_tensor = torch.tensor(speaker_ids_input, device=device) # For GAT - 不限制dtype
-            else:
-                raise TypeError(f"speaker_ids_input must be a list or tensor, got {type(speaker_ids_input)}")
-
-
-            seq_len = len(utterance_features_input)
-            if seq_len == 0:
-                 return torch.empty((1, 0, self.output_dim), device=device) # Handle empty sequence
-
-            # --- Processing ---
-            # 1. Aggregate Features: List[(tok, dim)] -> Tensor[seq_len, dim]
-            aggregated_features = self._aggregate_features(utterance_features_input, device) # [seq_len, token_embedding_dim]
-
-            # 2. Build Graph Structure (Types 1, 2, 4)
-            graph = self.graph_builder.build_graph_structure(
-                num_nodes=seq_len,
-                speaker_ids_list=speaker_ids_list_int, # Builder expects list of ints
-                timestamps=list(range(seq_len)) # Use index as timestamp
-            )
-
-            # 3. Compute Similarity and Build Cross-Turn Edges (Type 3)
-            if seq_len > 1:
-                similarity_matrix = self.graph_builder.compute_similarity_matrix(aggregated_features) # Use aggregated features
-                # Use fixed threshold for now
-                graph.build_cross_turn_edges(similarity_matrix, self.similarity_threshold_value)
-
-            # 4. Get Graph Tensors (Edges)
-            edge_index, edge_type, _, _ = graph.get_tensors(device) # 获取边类型，不再只是未使用的参数
+        # --- 验证输入 ---
+        if attention_masks is None:
+            raise ValueError("attention_masks must be provided")
             
-            # 5. Apply Graph Attention Network
-            # Input: aggregated_features, speaker_ids_tensor, edge_index, edge_type
-            node_embeddings = self.gat(aggregated_features, speaker_ids_tensor, edge_index, edge_type) # 传递边类型
-
-            # Reshape for consistent batch output: [1, seq_len, output_dim]
-            node_embeddings = node_embeddings.unsqueeze(0)
-
-        # --- Case 2: Use pre-defined graph ---
-        else:
-            # --- Input Validation ---
-            if not isinstance(utterance_features_input, torch.Tensor):
-                 raise ValueError("If edge_index is provided, utterance_features_input must be a pre-aggregated tensor [N, dim].")
-            if not isinstance(speaker_ids_input, torch.Tensor):
-                 raise ValueError("If edge_index is provided, speaker_ids_input must be a tensor [N].")
-            if utterance_features_input.ndim != 2 or utterance_features_input.shape[1] != self.token_embedding_dim:
-                raise ValueError(f"Expected pre-aggregated features of shape [N, {self.token_embedding_dim}], got {utterance_features_input.shape}")
-            if speaker_ids_input.ndim > 1 or speaker_ids_input.shape[0] != utterance_features_input.shape[0]:
-                 raise ValueError(f"Expected speaker_ids of shape [N={utterance_features_input.shape[0]}], got {speaker_ids_input.shape}")
-
-
-            # --- Processing ---
-            aggregated_features = utterance_features_input.to(device)
-            speaker_ids_tensor = speaker_ids_input.to(device) # 不转换为long
-            edge_index = edge_index.to(device)
-            # 确保边类型被传递到设备
-            if edge_type is not None:
-                edge_type = edge_type.to(device)
-
-            # Apply Graph Attention Network
-            node_embeddings = self.gat(aggregated_features, speaker_ids_tensor, edge_index, edge_type) # 传递边类型
-            # Caller is responsible for reshaping if needed (e.g., back to [batch, seq, dim])
+        # --- 处理单批次情况 (batch_size=1) ---
+        batch_size = utterance_features_input.size(0)
+        if batch_size != 1:
+            raise ValueError("Currently only supports batch_size=1")
+            
+        # 提取单批次数据
+        features = utterance_features_input[0]  # [max_num_segments, max_segment_len, feat_dim]
+        masks = attention_masks[0]  # [max_num_segments, max_segment_len]
         
-        return node_embeddings
+        # 处理speaker_ids - 增强类型处理能力
+        if isinstance(speaker_ids_input, torch.Tensor):
+            if speaker_ids_input.dim() == 2:  # [batch_size, max_num_segments]
+                speaker_ids = speaker_ids_input[0]  # [max_num_segments]
+            else:
+                speaker_ids = speaker_ids_input  # 假设已经是正确形状
+        elif isinstance(speaker_ids_input, list):
+            # 处理嵌套列表情况 (来自DataLoader的批次)
+            if len(speaker_ids_input) > 0 and isinstance(speaker_ids_input[0], list):
+                # 获取第一个批次的speaker_ids
+                batch_speakers = speaker_ids_input[0]
+                
+                # 将任何非数值类型的ID转换为数值索引
+                speaker_to_idx = {}
+                next_idx = 0
+                processed_speakers = []
+                
+                for speaker in batch_speakers:
+                    if speaker not in speaker_to_idx:
+                        speaker_to_idx[speaker] = next_idx
+                        next_idx += 1
+                    processed_speakers.append(speaker_to_idx[speaker])
+                
+                speaker_ids = torch.tensor(processed_speakers, device=device)
+            else:
+                # 单层列表，直接转换
+                try:
+                    speaker_ids = torch.tensor(speaker_ids_input, device=device)
+                except (ValueError, TypeError):
+                    # 处理列表中包含非数值类型的情况
+                    speaker_to_idx = {}
+                    next_idx = 0
+                    processed_speakers = []
+                    
+                    for speaker in speaker_ids_input:
+                        if speaker not in speaker_to_idx:
+                            speaker_to_idx[speaker] = next_idx
+                            next_idx += 1
+                        processed_speakers.append(speaker_to_idx[speaker])
+                    
+                    speaker_ids = torch.tensor(processed_speakers, device=device)
+        else:
+            raise TypeError(f"Unsupported speaker_ids_input type: {type(speaker_ids_input)}")
+        
+        # 移动数据到设备
+        features = features.to(device)
+        masks = masks.to(device)
+        speaker_ids = speaker_ids.to(device)
+        
+        # 如果需要，调整特征维度以满足GAT要求
+        features = self.dim_adjust(features)
+        
+        # --- 构建图结构 ---
+        num_segments = features.size(0)
+        
+        if edge_index is None or edge_type is None:
+            # 自动构建图结构
+            graph = self.graph_builder.build_graph_structure(
+                num_nodes=num_segments,
+                speaker_ids_list=speaker_ids.cpu().tolist(),
+                timestamps=list(range(num_segments))
+            )
+            
+            # 构建跨轮次边 (Type 3) - 基于掩码计算相似度
+            if num_segments > 1:
+                # 使用掩码计算节点间相似度
+                similarity_matrix = self.graph_builder.compute_masked_similarity_matrix(features, masks)
+                graph.build_cross_turn_edges(similarity_matrix, self.similarity_threshold_value)
+                
+            # 获取图张量
+            edge_index, edge_type, _, _ = graph.get_tensors(device)
+            
+        # --- 应用图注意力网络 ---
+        updated_features = self.gat(
+            features,      # [max_num_segments, max_segment_len, hidden_dim]
+            masks,         # [max_num_segments, max_segment_len]
+            speaker_ids,   # [max_num_segments]
+            edge_index,    # [2, num_edges]
+            edge_type      # [num_edges]
+        )
+        
+        # 投影输出特征到output_dim（如果需要）
+        updated_features = self.output_projection(updated_features)  # [max_num_segments, max_segment_len, output_dim]
+        
+        # 确保填充位置的特征为0
+        updated_features = updated_features * masks.unsqueeze(-1).float()
+        
+        # 强制掩码位置为准确的0
+        if masks.numel() > 0:
+            mask_inverted = ~masks.bool()
+            updated_features.masked_fill_(mask_inverted.unsqueeze(-1), 0.0)
+
+            # 1. 节点内池化 (Token Pooling)
+            token_mask = masks.unsqueeze(-1).float()  # [max_num_segments, max_segment_len, 1]
+            token_sum = (updated_features * token_mask).sum(dim=1)  # [max_num_segments, output_dim]
+            num_valid_tokens = masks.sum(dim=1, keepdim=True).clamp(min=1e-9)  # [max_num_segments, 1]
+            segment_embeddings = token_sum / num_valid_tokens  # [max_num_segments, output_dim]
+
+            # 2. 图级别池化 (Node/Segment Pooling)
+            # 创建有效 segment 的掩码 (假设没有完全填充的 segment)
+            segment_mask = masks.any(dim=-1) # [max_num_segments]
+            segment_mask_expanded = segment_mask.unsqueeze(-1).float() # [max_num_segments, 1]
+
+            graph_sum = (segment_embeddings * segment_mask_expanded).sum(dim=0)  # [output_dim]
+            num_valid_segments = segment_mask.sum(dim=0).clamp(min=1e-9)  # scalar
+            graph_embedding = graph_sum / num_valid_segments  # [output_dim]
+
+            # 添加批次维度
+            graph_embedding = graph_embedding.unsqueeze(0) # [1, output_dim]
+
+            # 分离梯度
+            with torch.no_grad():
+                result = graph_embedding.detach().clone()
+        else:
+            # 返回节点特征
+            # 重塑为批次形式
+            node_embeddings = updated_features.unsqueeze(0)  # [1, max_num_segments, max_segment_len, output_dim]
+            
+            # 分离梯度，确保返回的张量不带梯度
+            with torch.no_grad():
+                result = node_embeddings.detach().clone()
+        
+        return result
     
-    # get_node_embeddings remains similar to the forward pass logic for auto-build case
-    def get_node_embeddings(self, utterance_features_list, speaker_ids_list):
+    def get_node_embeddings(self, utterance_features, speaker_ids, attention_masks):
         """
         获取对话中所有节点的嵌入表示 (non-batched, builds graph internally).
         
         参数:
-            utterance_features_list: 话语特征列表 List[(token_num, dim)]
-            speaker_ids_list: 说话者ID列表 List[int]
+            utterance_features: 话语特征 [batch_size, max_num_segments, max_segment_len, feat_dim]
+            speaker_ids: 说话者ID [batch_size, max_num_segments] 或 List[int]
+            attention_masks: 注意力掩码 [batch_size, max_num_segments, max_segment_len]
             
         返回:
-            节点嵌入列表 List[Tensor(output_dim)]
+            每个节点的更新特征 [max_num_segments, max_segment_len, output_dim] (移除批次维度)
         """
-        self.eval() # Set to evaluation mode
-        device = next(self.parameters()).device
+        self.eval()  # 设置为评估模式
         with torch.no_grad():
-             # Ensure inputs are lists
-             if not isinstance(utterance_features_list, list):
-                 raise TypeError("utterance_features_list must be a list for get_node_embeddings")
-             if not isinstance(speaker_ids_list, list):
-                 raise TypeError("speaker_ids_list must be a list for get_node_embeddings")
+            # 使用forward方法处理输入, 获取节点嵌入
+            node_features = self.forward(
+                utterance_features,
+                speaker_ids,
+                attention_masks=attention_masks
+            )
+            
+            # 删除批次维度
+            node_features = node_features.squeeze(0)  # [max_num_segments, max_segment_len, output_dim]
+            
+        # 确保没有梯度
+        return node_features.detach()
 
-             # Use the forward pass logic for batch_size=1 auto-build
-             embeddings_batch = self.forward(utterance_features_list, speaker_ids_list, edge_index=None, edge_type=None) # Output: [1, seq_len, output_dim]
-
-             # Convert back to list
-             if embeddings_batch.nelement() > 0:
-                 node_embeddings_list = [embeddings_batch[0, i].cpu() for i in range(embeddings_batch.shape[1])] # Move to CPU for list output
-             else:
-                 node_embeddings_list = []
-
-        return node_embeddings_list
+    def get_graph_embedding(self, utterance_features, speaker_ids, attention_masks):
+        """
+        获取整个对话图的嵌入表示 (non-batched, builds graph internally).
+        
+        参数:
+            utterance_features: 话语特征 [batch_size, max_num_segments, max_segment_len, feat_dim]
+            speaker_ids: 说话者ID [batch_size, max_num_segments] 或 List[int]
+            attention_masks: 注意力掩码 [batch_size, max_num_segments, max_segment_len]
+            
+        返回:
+            图的嵌入表示 [output_dim] (移除批次维度)
+        """
+        self.eval() # 设置为评估模式
+        with torch.no_grad():
+            # 使用forward方法处理输入
+            # forward 方法现在默认返回图嵌入
+            graph_embedding = self.forward(
+                utterance_features,
+                speaker_ids,
+                attention_masks=attention_masks
+            )
+            
+            # 删除批次维度
+            graph_embedding = graph_embedding.squeeze(0) # [output_dim]
+            
+        # 确保没有梯度
+        return graph_embedding.detach()
