@@ -2,6 +2,36 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import dataclasses
+from typing import Optional, Union, List, Dict, Any
+
+
+class DialogueGraphConfig:
+    """对话图模型的配置类，包含所有用于初始化 DialogueGraphModel 的参数"""
+    
+    # 模型结构参数
+    token_embedding_dim: int = 768  # 输入token嵌入维度
+    output_dim: Optional[int] = None  # 输出特征维度，如果为None则等于token_embedding_dim
+    num_heads: int = 4  # 注意力头数量
+    speaker_embedding_dim: Optional[int] = 16  # 说话者嵌入维度
+    num_speakers: Optional[int] = None  # 说话者数量，如果为None则动态确定
+    num_layers: int = 2  # GAT层数
+    
+    # 图结构参数
+    similarity_threshold: float = 0.8  # 构建跨轮次关联边的相似度阈值
+    context_window_size: int = 4  # 用户关联边的上下文窗口大小
+    
+    # 训练参数
+    dropout: float = 0.1  # Dropout概率
+    
+    def asdict(self) -> Dict[str, Any]:
+        """将配置转换为字典格式，以便传递给模型初始化函数"""
+        return dataclasses.asdict(self)
+    
+    @classmethod
+    def from_dict(cls, config_dict: Dict[str, Any]) -> "DialogueGraphConfig":
+        """从字典创建配置实例"""
+        return cls(**config_dict)
 
 
 class Node:
@@ -538,7 +568,7 @@ class MultiHeadAttentionWithMask(nn.Module):
         output = output + node_features
         
         # 确保填充位置保持为0 (使用精确的掩码机制)
-        output = output * node_masks.unsqueeze(-1).float()
+        output = output * node_masks.unsqueeze(-1).to(dtype=node_features.dtype)
         
         return output
 
@@ -672,7 +702,7 @@ class DialogueGraphBuilder:
             return torch.zeros((0, 0), device=device)
         
         # 扩展掩码为 [num_nodes, max_seq_len, 1]
-        expanded_masks = masks.unsqueeze(-1).float()
+        expanded_masks = masks.unsqueeze(-1).to(dtype=features.dtype)
         
         # 计算每个节点的平均特征向量 (用于相似度计算)
         # [num_nodes, dim]
@@ -744,9 +774,10 @@ class DialogueGraphBuilder:
 class DialogueGraphModel(nn.Module):
     """对话图模型，集成图注意力网络和其他组件"""
     
-    def __init__(self, token_embedding_dim, output_dim=None, num_heads=4,
+    def __init__(self, token_embedding_dim=None, output_dim=None, num_heads=4,
                  speaker_embedding_dim=None, num_speakers=None, num_layers=2, dropout=0.2,
-                 similarity_threshold=0.8, context_window_size=3):
+                 similarity_threshold=0.8, context_window_size=3, config=None,
+                 dtype=None):
         """
         初始化对话图模型
         
@@ -760,9 +791,35 @@ class DialogueGraphModel(nn.Module):
             dropout: Dropout概率
             similarity_threshold: 相似度阈值 (初始值，可以设为可学习)
             context_window_size: 上下文窗口大小
+            config: DialogueGraphConfig 实例，如果提供则使用其中的参数值
+            dtype: 指定计算精度，如torch.bfloat16或torch.float32
         """
         super(DialogueGraphModel, self).__init__()
 
+        # 设置计算精度
+        self.dtype = dtype
+
+        # 如果提供了 config，则使用 config 中的参数
+        if config is not None:
+            if isinstance(config, dict):
+                config = DialogueGraphConfig.from_dict(config)
+            elif not isinstance(config, DialogueGraphConfig):
+                raise ValueError(f"config 必须是 DialogueGraphConfig 实例或字典，而不是 {type(config)}")
+            
+            token_embedding_dim = config.token_embedding_dim
+            output_dim = config.output_dim
+            num_heads = config.num_heads
+            speaker_embedding_dim = config.speaker_embedding_dim
+            num_speakers = config.num_speakers
+            num_layers = config.num_layers
+            dropout = config.dropout
+            similarity_threshold = config.similarity_threshold
+            context_window_size = config.context_window_size
+        
+        # 如果未指定 token_embedding_dim，使用默认值
+        if token_embedding_dim is None:
+            token_embedding_dim = 768  # 默认使用 768 维度，与常见预训练模型兼容
+            
         self.token_embedding_dim = token_embedding_dim
             
         # 如果未指定output_dim，默认设为等于token_embedding_dim
@@ -822,6 +879,19 @@ class DialogueGraphModel(nn.Module):
             self.output_projection = nn.Linear(gat_dim, output_dim)
         else:
             self.output_projection = nn.Identity()
+            
+    @classmethod
+    def from_config(cls, config):
+        """从 DialogueGraphConfig 创建模型实例"""
+        if isinstance(config, dict):
+            config = DialogueGraphConfig.from_dict(config)
+        return cls(config=config)
+
+    def _cast_to_dtype(self, tensor):
+        """将张量转换为指定的数据类型"""
+        if self.dtype is not None and tensor.dtype != torch.bool and tensor.dtype != torch.long:
+            return tensor.to(dtype=self.dtype)
+        return tensor
 
     def forward(self, utterance_features_input, speaker_ids_input, attention_masks=None, edge_index=None, edge_type=None):
         """
@@ -896,9 +966,9 @@ class DialogueGraphModel(nn.Module):
         else:
             raise TypeError(f"Unsupported speaker_ids_input type: {type(speaker_ids_input)}")
         
-        # 移动数据到设备
-        features = features.to(device)
-        masks = masks.to(device)
+        # 移动数据到设备并转换精度
+        features = self._cast_to_dtype(features.to(device))
+        masks = masks.to(device)  # 掩码保持布尔或整型
         speaker_ids = speaker_ids.to(device)
         
         # 如果需要，调整特征维度以满足GAT要求
@@ -959,8 +1029,8 @@ class DialogueGraphModel(nn.Module):
             num_valid_segments = segment_mask.sum(dim=0).clamp(min=1e-9)  # scalar
             graph_embedding = graph_sum / num_valid_segments  # [output_dim]
 
-            # 添加批次维度
-            graph_embedding = graph_embedding.unsqueeze(0) # [1, output_dim]
+            # 确保输出也是正确的 dtype
+            graph_embedding = graph_embedding.unsqueeze(0).to(dtype=updated_features.dtype) # [1, output_dim]
 
             # 分离梯度
             with torch.no_grad():

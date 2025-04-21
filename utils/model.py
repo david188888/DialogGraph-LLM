@@ -153,11 +153,11 @@ class Qwen2_5OmniAudioProcessor(ProcessorMixin):
         if isinstance(audios, torch.Tensor):
             audios = audios.cpu().numpy()
             
-        # 打印一下音频数据的信息，便于调试
-        if isinstance(audios, np.ndarray):
-            print(f"处理音频数据: 形状={audios.shape}, 类型={audios.dtype}, 值范围=[{np.min(audios):.3f}, {np.max(audios):.3f}]")
-        elif isinstance(audios, list):
-            print(f"处理音频数据列表，长度={len(audios)}")
+        # # 打印一下音频数据的信息，便于调试
+        # if isinstance(audios, np.ndarray):
+        #     # print(f"处理音频数据: 形状={audios.shape}, 类型={audios.dtype}, 值范围=[{np.min(audios):.3f}, {np.max(audios):.3f}]")
+        # elif isinstance(audios, list):
+        #     print(f"处理音频数据列表，长度={len(audios)}")
 
         try:
             # 使用WhisperFeatureExtractor提取初始特征
@@ -213,8 +213,7 @@ class Qwen2_5OmniAudioProcessor(ProcessorMixin):
                     # 检查并添加attention_mask
                     if hasattr(audio_encoder_outputs, "attention_mask"):
                         outputs["audio_encoded_attention_mask"] = audio_encoder_outputs.attention_mask
-                    else:
-                        print("audio_encoder_outputs没有attention_mask属性")
+
                         
                     # 将音频输出长度也添加到输出中，以便后续使用
                     outputs["audio_output_lengths"] = audio_output_lengths

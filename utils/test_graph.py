@@ -53,8 +53,6 @@ try:
         labels_file=LABELS_FILE,
         cache_dir=CACHE_DIR,
         batch_size=1,  # 当前模型实现仅支持 batch_size=1
-        shuffle=False, # 测试时通常不打乱
-        num_workers=0,
         model_path=MODEL_PATH
     )
     
