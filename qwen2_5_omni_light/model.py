@@ -4,11 +4,11 @@ from typing import Optional, Union, List, Dict, Any, Tuple
 from dataclasses import dataclass
 
 from transformers import PreTrainedModel
-# 正确导入GenerationMixin
+# Correctly import GenerationMixin
 from transformers.generation.utils import GenerationMixin
 from transformers.modeling_outputs import ModelOutput
 
-# 导入Qwen2.5Omni相关配置和模型
+# Import Qwen2.5Omni related configs and models
 from transformers import (
     Qwen2_5OmniThinkerConfig,
     Qwen2_5OmniConfig
@@ -23,26 +23,25 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniAu
 @dataclass
 class Qwen2_5OmniLightCausalLMOutputWithPast(ModelOutput):
     """
-    为简化版的Qwen2.5OmniLight模型设计的输出类，只支持音频和文本模态。
+    Output class for the simplified Qwen2.5OmniLight model, supporting only audio and text modalities.
 
     Args:
         loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
-            语言建模损失(用于下一个token预测)。
+            Language modeling loss (for next token prediction).
         logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`, *optional*):
-            语言建模头的预测分数(SoftMax之前每个词汇token的分数)。
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
         past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
-            包含预计算的隐藏状态(self-attention块中的key和value)的元组，可用于加速序列解码。
+            Tuple containing precomputed hidden states (key and value in self-attention blocks), used to speed up sequence decoding.
         hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
-            每层输出的隐藏状态元组，形状为`(batch_size, sequence_length, hidden_size)`。
+            Tuple of hidden states from each layer, shape `(batch_size, sequence_length, hidden_size)`.
         attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
-            每层注意力权重的元组，形状为`(batch_size, num_heads, sequence_length, sequence_length)`。
+            Tuple of attention weights from each layer, shape `(batch_size, num_heads, sequence_length, sequence_length)`.
         attention_mask (`torch.FloatTensor`, *optional*):
-            注意力掩码，用于更新attention_mask和position_ids。
+            Attention mask, used to update attention_mask and position_ids.
         rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
-            序列长度和多模态rope之间的rope索引差异。
-            
-            
-        数据容器类,用于封装model output
+            Rope index difference between sequence length and multimodal rope.
+
+        Data container class for model output.
     """
 
     loss: Optional[torch.FloatTensor] = None
@@ -55,10 +54,9 @@ class Qwen2_5OmniLightCausalLMOutputWithPast(ModelOutput):
 
 class Qwen2_5OmniLightForConditionalGeneration(Qwen2_5OmniPreTrainedModelForConditionalGeneration, GenerationMixin):
     """
-    简化版的Qwen2.5Omni模型，只支持音频和文本模态。
-    
-    这个模型移除了图像和视频处理相关的代码，保留了原始Qwen2_5OmniThinkerForConditionalGeneration
-    处理音频和文本的功能。
+    Simplified version of the Qwen2.5Omni model, supporting only audio and text modalities.
+
+    This model removes image and video processing code, retaining the original Qwen2_5OmniThinkerForConditionalGeneration's audio and text processing functionality.
     """
     
     config_class = Qwen2_5OmniThinkerConfig
@@ -67,7 +65,7 @@ class Qwen2_5OmniLightForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCond
     def __init__(self, config: Qwen2_5OmniThinkerConfig):
         super().__init__(config)
         
-        # 正确初始化子模型，使用_from_config方法
+        # Correctly initialize submodules using _from_config
         self.audio_tower = None
         if hasattr(config, "audio_config") and config.audio_config is not None:
             self.audio_tower = Qwen2_5OmniAudioEncoder._from_config(
@@ -76,8 +74,7 @@ class Qwen2_5OmniLightForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCond
         
         self.vocab_size = config.text_config.vocab_size
         
-        # 初始化主模型
-
+        # Initialize main model
         self.model = Qwen2_5OmniThinkerModel._from_config(
             config.text_config, attn_implementation=config._attn_implementation
         )
@@ -91,6 +88,7 @@ class Qwen2_5OmniLightForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCond
         self,
         input_ids: Optional[torch.LongTensor] = None,
         input_features: Optional[torch.FloatTensor] = None,
+        graph_audio_features: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         feature_attention_mask: Optional[torch.Tensor] = None,
         use_audio_in_video: Optional[bool] = None,
@@ -107,27 +105,26 @@ class Qwen2_5OmniLightForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCond
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, Qwen2_5OmniLightCausalLMOutputWithPast]:
         """
-        简化版的forward方法，只处理音频和文本输入。
+        Simplified forward method, only processes audio and text inputs.
         
         Args:
-            input_ids: 输入ID
-            input_features: 音频特征输入
-            attention_mask: 注意力掩码
-            feature_attention_mask: 特征注意力掩码
-            audio_feature_lengths: 音频特征长度
-            position_ids: 位置ID
-            past_key_values: 过去的键值对
-            inputs_embeds: 输入嵌入
-            rope_deltas: Rope索引差异
-            labels: 标签(用于计算损失)
-            use_cache: 是否使用缓存
-            output_attentions: 是否输出注意力权重
-            output_hidden_states: 是否输出隐藏状态
-            return_dict: 是否以字典形式返回
-            cache_position: 缓存位置
-            
+            input_ids: Input IDs
+            input_features: Audio feature input
+            attention_mask: Attention mask
+            feature_attention_mask: Feature attention mask
+            audio_feature_lengths: Audio feature lengths
+            position_ids: Position IDs
+            past_key_values: Past key-value pairs
+            inputs_embeds: Input embeddings
+            rope_deltas: Rope index difference
+            labels: Labels (for loss computation)
+            use_cache: Whether to use cache
+            output_attentions: Whether to output attention weights
+            output_hidden_states: Whether to output hidden states
+            return_dict: Whether to return as a dictionary
+            cache_position: Cache position
         Returns:
-            模型输出
+            Model output
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -184,6 +181,7 @@ class Qwen2_5OmniLightForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCond
                         input_features,
                         feature_lens=feature_lens,
                         aftercnn_lens=audio_feat_lengths,
+                        
                     )
                     audio_features = audio_outputs.last_hidden_state
                     if audio_features.shape[0] != sum(audio_output_lengths.tolist()):
@@ -192,6 +190,11 @@ class Qwen2_5OmniLightForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCond
                     audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
                     inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
                     embeds_to_talker = embeds_to_talker.masked_scatter(audio_mask, torch.zeros_like(audio_features))
+                if graph_audio_features is not None:
+                    image_mask = (input_ids == self.config.image_token_index).unsqueeze(-1).expand_as(inputs_embeds)
+                    graph_audio_features = graph_audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
+                    inputs_embeds = inputs_embeds.masked_scatter(image_mask, graph_audio_features)
+
 
                 if attention_mask is not None:
                     attention_mask = attention_mask.to(inputs_embeds.device)
@@ -256,7 +259,7 @@ class Qwen2_5OmniLightForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCond
         **kwargs,
     ):
         """
-        为生成准备输入 - 简化版，只处理音频和文本。
+        Prepare inputs for generation - simplified version, only processes audio and text.
         """
         # 使用父类方法
         model_inputs = super().prepare_inputs_for_generation(
@@ -301,14 +304,14 @@ class Qwen2_5OmniLightForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCond
 
 class Qwen2_5OmniTextOnlyModel(Qwen2_5OmniPreTrainedModel):
     """
-    优化版的Qwen2.5Omni纯文本输出模型。
-    专注于高效处理多模态输入并只生成文本输出。
+    Optimized Qwen2.5Omni text-only output model.
+    Focuses on efficiently handling multimodal input and generating only text output.
     """
     config_class = Qwen2_5OmniConfig
 
     def __init__(self, config):
         super().__init__(config)
-        # 只初始化Thinker组件
+        # Only initialize the Thinker component
         self.thinker = Qwen2_5OmniLightForConditionalGeneration(config.thinker_config)
         
     @classmethod
@@ -324,16 +327,15 @@ class Qwen2_5OmniTextOnlyModel(Qwen2_5OmniPreTrainedModel):
         **kwargs,
     ):
         """
-        从多模态输入生成文本输出。
+        Generate text output from multimodal input.
         
         Args:
-            input_ids: 输入ID，应该从processor获取
-            use_audio_in_video: 是否使用视频中的音频轨道
-            thinker_max_new_tokens: 生成的最大新token数量
-            **kwargs: 其他参数，将传递给thinker的generate方法
-            
+            input_ids: Input IDs, should be obtained from processor
+            use_audio_in_video: Whether to use audio track in video
+            thinker_max_new_tokens: Maximum number of new tokens to generate
+            **kwargs: Other arguments, passed to the thinker's generate method
         Returns:
-            生成的文本token序列
+            Generated text token sequence
         """
         shared_kwargs = {"use_audio_in_video": use_audio_in_video}
         thinker_kwargs = {
@@ -364,6 +366,6 @@ class Qwen2_5OmniTextOnlyModel(Qwen2_5OmniPreTrainedModel):
     
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        """从预训练模型加载TextOnly版本，只加载Thinker部分"""
+        """Load TextOnly version from pretrained model, only loads Thinker part"""
         return super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)  
 

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # 简化版本：直接导出我们需要的类
-from .modeling_qwen2_5omni_light import Qwen2_5OmniLightForConditionalGeneration, Qwen2_5OmniTextOnlyModel
+from .model import Qwen2_5OmniLightForConditionalGeneration, Qwen2_5OmniTextOnlyModel
 from .processing_qwen2_5omni_light import Qwen2_5OmniLightProcessor
 # from .model import Qwen2_5OmniTextOnlyModel
 __all__ = ["Qwen2_5OmniLightForConditionalGeneration", "Qwen2_5OmniLightProcessor", "Qwen2_5OmniTextOnlyModel"]

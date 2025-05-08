@@ -8,8 +8,8 @@ from transformers.feature_extraction_utils import BatchFeature
 from transformers.processing_utils import ProcessingKwargs, ProcessorMixin
 from transformers.tokenization_utils_base import PaddingStrategy, PreTokenizedInput, TextInput
 from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniAudioEncoder
-from .modeling_qwen2_5omni_light import Qwen2_5OmniTextOnlyModel
-# 注意：在新版transformers中，Unpack可能在typing_extensions中
+from .model import Qwen2_5OmniTextOnlyModel
+# Note: In newer versions of transformers, Unpack may be in typing_extensions
 try:
     from transformers.processing_utils import Unpack
 except ImportError:
@@ -25,7 +25,7 @@ class Qwen2_5OmniLightProcessorKwargs(ProcessingKwargs, total=False):
 
 class Qwen2_5OmniLightProcessor(ProcessorMixin):
     """
-    简化版的Qwen2.5Omni处理器，仅处理文本和音频输入。
+    Simplified Qwen2.5Omni processor, only processes text and audio input.
     """
 
     attributes = ["feature_extractor", "tokenizer"]
@@ -48,7 +48,7 @@ class Qwen2_5OmniLightProcessor(ProcessorMixin):
         **kwargs: Unpack[Qwen2_5OmniLightProcessorKwargs],
     ) -> BatchFeature:
         """
-        处理文本和音频输入。
+        Process text and audio input.
         """
         output_kwargs = self._merge_kwargs(
             Qwen2_5OmniLightProcessorKwargs,
@@ -134,8 +134,8 @@ class Qwen2_5OmniLightProcessor(ProcessorMixin):
 
 class Qwen2_5OmniAudioProcessor(ProcessorMixin):
     """
-    Qwen2.5Omni音频处理器，专用于音频特征提取。
-    结合了WhisperFeatureExtractor用于初始特征提取和Qwen2_5OmniAudioEncoder用于音频编码。
+    Qwen2.5Omni audio processor, specialized for audio feature extraction.
+    Combines WhisperFeatureExtractor for initial feature extraction and Qwen2_5OmniAudioEncoder for audio encoding.
     Example:
     path = "file://test.wav"
     audios = librosa.load(path[len("file://") :], sr=16000)[0]
@@ -157,21 +157,20 @@ class Qwen2_5OmniAudioProcessor(ProcessorMixin):
         **kwargs
     ):
         """
-        从预训练模型路径加载处理器
+        Load processor from pretrained model path.
         
         Args:
-            pretrained_model_name_or_path: 预训练模型路径或名称
-            **kwargs: 额外参数
-            
+            pretrained_model_name_or_path: Pretrained model path or name
+            **kwargs: Additional arguments
         Returns:
-            Qwen2_5OmniAudioProcessor: 加载好的处理器实例
+            Qwen2_5OmniAudioProcessor: Loaded processor instance
         """
-        # 加载特征提取器
+        # Load feature extractor
         feature_extractor = WhisperFeatureExtractor.from_pretrained(
             pretrained_model_name_or_path, 
         )
         
-        # 加载音频编码器配置
+        # Load audio encoder config
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
         config = config.thinker_config
         if hasattr(config, "audio_config") and config.audio_config is not None:
@@ -186,12 +185,12 @@ class Qwen2_5OmniAudioProcessor(ProcessorMixin):
                     **{k: v for k, v in kwargs.items() if k != "load_weights"}
                 )
                         
-                # 如果是Qwen2_5OmniThinkerForConditionalGeneration模型
+                # If it is Qwen2_5OmniThinkerForConditionalGeneration model
                 if hasattr(model, "audio_tower"):
                     audio_encoder.load_state_dict(model.audio_tower.state_dict())
 
                         
-                # 清理临时模型
+                # Clean up temporary model
                 del model
                 import gc
                 gc.collect()
@@ -211,20 +210,19 @@ class Qwen2_5OmniAudioProcessor(ProcessorMixin):
         **kwargs: Unpack[Qwen2_5OmniLightProcessorKwargs],
     ) -> BatchFeature:
         """
-        处理音频输入并提取特征。
+        Process audio input and extract features.
         
         Args:
-            audios: 输入音频数据，可以是单个音频数组或音频数组列表
-            sampling_rate: 音频采样率，默认16kHz
-            padding: 是否对输入进行填充
-            return_tensors: 返回的张量类型，默认为PyTorch
-            **kwargs: 其他参数
-            
+            audios: Input audio data, can be a single audio array or a list of audio arrays
+            sampling_rate: Audio sampling rate, default 16kHz
+            padding: Whether to pad the input
+            return_tensors: Type of returned tensor, default PyTorch
+            **kwargs: Other arguments
         Returns:
-            包含处理后音频特征的BatchFeature对象
+            BatchFeature object containing processed audio features
         """
         if audios is None:
-            raise ValueError("需要指定`audios`输入进行处理。")
+            raise ValueError("You need to specify `audios` input for processing.")
 
         output_kwargs = self._merge_kwargs(
             Qwen2_5OmniLightProcessorKwargs,
@@ -233,7 +231,7 @@ class Qwen2_5OmniAudioProcessor(ProcessorMixin):
             **kwargs,
         )
         
-        # 使用WhisperFeatureExtractor提取初始特征
+        # Use WhisperFeatureExtractor to extract initial features
         audio_features = self.feature_extractor(
             audios, 
             sampling_rate=sampling_rate, 
@@ -243,7 +241,7 @@ class Qwen2_5OmniAudioProcessor(ProcessorMixin):
             **kwargs
         )
         
-        # 重命名特征以符合Qwen2.5OmniAudioEncoder的输入格式
+        # Rename features to match Qwen2.5OmniAudioEncoder input format
         input_features = audio_features.pop("input_features")
         feature_attention_mask = audio_features.pop("attention_mask") if "attention_mask" in audio_features else None
         
@@ -252,10 +250,10 @@ class Qwen2_5OmniAudioProcessor(ProcessorMixin):
             "feature_attention_mask": feature_attention_mask,
         }
         
-        # 如果提供了audio_encoder，则进一步编码音频特征
+        # If audio_encoder is provided, further encode audio features
         if self.audio_encoder is not None and return_tensors == "pt":
             with torch.no_grad():
-                # 计算音频长度
+                # Compute audio lengths
                 if feature_attention_mask is not None:
                     feature_lens = feature_attention_mask.sum(-1)
                     audio_feat_lengths, audio_output_lengths = self.audio_encoder._get_feat_extract_output_lengths(feature_lens)
@@ -263,7 +261,7 @@ class Qwen2_5OmniAudioProcessor(ProcessorMixin):
                     feature_lens = None
                     audio_feat_lengths = None
                 
-                # 使用audio_encoder编码音频特征
+                # Use audio_encoder to encode audio features
                 audio_encoder_outputs = self.audio_encoder(
                     input_features,
                     feature_lens=feature_lens,
@@ -272,7 +270,7 @@ class Qwen2_5OmniAudioProcessor(ProcessorMixin):
                     return_dict=True,
                 )
                 
-                # 添加编码后的特征到输出
+                # Add encoded features to output
                 outputs["audio_encoded_features"] = audio_encoder_outputs.last_hidden_state
                 if hasattr(audio_encoder_outputs, "attention_mask"):
                     outputs["audio_encoded_attention_mask"] = audio_encoder_outputs.attention_mask
@@ -287,4 +285,4 @@ class Qwen2_5OmniAudioProcessor(ProcessorMixin):
         names = self.feature_extractor.model_input_names + ["feature_attention_mask"]
         if self.audio_encoder is not None:
             names += ["audio_encoded_features", "audio_encoded_attention_mask"]
-        return list(dict.fromkeys(names))  # 去重
+        return list(dict.fromkeys(names))  # Remove duplicates

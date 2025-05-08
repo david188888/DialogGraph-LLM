@@ -20,7 +20,7 @@ from transformers.processing_utils import ProcessorMixin, ProcessingKwargs
 from transformers.tokenization_utils_base import PaddingStrategy
 
 # 现在导入ECAI模块
-from ECAI.qwen2_5_omni_light.modeling_qwen2_5omni_light import Qwen2_5OmniTextOnlyModel
+from ECAI.qwen2_5_omni_light.model import Qwen2_5OmniTextOnlyModel
 
 # 注意：在新版transformers中，Unpack可能在typing_extensions中
 try:

@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from accelerate import Accelerator
 # 添加学习率调度器相关导入
 from transformers import get_scheduler, get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup, get_constant_schedule_with_warmup
@@ -32,9 +32,10 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 # )
 from transformers import AutoConfig
 import numpy as np # 添加 numpy
+from itertools import cycle # 用于处理不同长度的数据加载器
 
 
-from ECAI.qwen2_5_omni_light import Qwen2_5OmniLightProcessor, Qwen2_5OmniTextOnlyModel
+from ECAI.qwen2_5_omni_light import Qwen2_5OmniLightProcessor, Qwen2_5OmniLightForConditionalGeneration, Qwen2_5OmniTextOnlyModel
 
 
 from utils.graph import DialogueGraphModel
@@ -261,18 +262,18 @@ class AdaptiveThresholdTrainer:
         # 学习率调度器将在train方法中初始化，因为需要知道总训练步数
 
     def _init_lr_scheduler(self, num_training_steps):
-        """初始化学习率调度器，实现Warm-up + cosine decay策略"""
+        """初始化学习率调度器，实现Warm-up + linear decay策略"""
         warmup_steps = int(num_training_steps * self.warmup_ratio)  # 使用5-10%的步数作为warm-up
-        logger.info(f"初始化学习率调度器: Warm-up + cosine decay, 总步数={num_training_steps}, warmup步数={warmup_steps}")
+        logger.info(f"初始化学习率调度器: Warm-up + linear decay, 总步数={num_training_steps}, warmup步数={warmup_steps}")
         
-        # 使用cosine学习率调度器，它会在warmup后按余弦函数衰减
+        # 使用linear学习率调度器，它会在warmup后线性衰减
         self.lr_scheduler = get_scheduler(
-            name="cosine",  # 改为cosine实现warm-up + cosine decay
+            name="linear",  # 改为linear实现warm-up + linear decay
             optimizer=self.optimizer,
             num_warmup_steps=warmup_steps,
             num_training_steps=num_training_steps
         )
-        logger.info(f"已创建 Warm-up + cosine decay 学习率调度器，warmup步数: {warmup_steps}")
+        logger.info(f"已创建 Warm-up + linear decay 学习率调度器，warmup步数: {warmup_steps}")
 
     # --- 半监督辅助函数 ---
     def _update_adaptive_thresholds(self, Q_u):
@@ -282,23 +283,19 @@ class AdaptiveThresholdTrainer:
         参数:
             Q_u: 无标签数据的预测概率 [batch_size, num_classes]
         """
-        # 确保在同一设备上操作
-        device = self.tau.device
-        Q_u = Q_u.to(device)
-        
         # 1. 计算每个样本的最大预测概率
         max_probs, _ = torch.max(Q_u, dim=1)  
 
         # 2. 更新全局置信度阈值（EMA）
         # tau: 通过指数移动平均(EMA)方式更新的全局置信度阈值
         # 当前批次中所有样本最大预测概率的平均值用于调整全局阈值
-        batch_avg_confidence = torch.mean(max_probs)
+        batch_avg_confidence = torch.mean(max_probs).to(self.tau.device) 
         self.tau = self.lambda_ema * self.tau + (1 - self.lambda_ema) * batch_avg_confidence
 
         # 3. 更新类别平均预测概率（EMA）
         # p_tilde: 跟踪每个类别的平均预测概率，用于后续计算类别特定阈值
         # 体现了当前数据集中不同类别的分布情况
-        batch_class_avg = torch.mean(Q_u, dim=0)
+        batch_class_avg = torch.mean(Q_u, dim=0).to(self.p_tilde.device)
         self.p_tilde = self.lambda_ema * self.p_tilde + (1 - self.lambda_ema) * batch_class_avg
 
         # 4. 计算每个类别的自适应阈值
@@ -328,13 +325,8 @@ class AdaptiveThresholdTrainer:
             P_u: 生成的伪标签 [batch_size, num_classes] (0.0或1.0)
             mask: 有效伪标签的掩码 [batch_size] (0.0或1.0)
         """
-        # 确保tau_c在与Q_u相同的设备上
-        device = Q_u.device
-        tau_c = self.tau_c.to(device)
-        margin_epsilon = torch.tensor(self.margin_epsilon, device=device)
-        
         # 使用tau_c (类别特定阈值) 检查哪些样本超过阈值
-        tau_c_expanded = tau_c.unsqueeze(0)  # [1, num_classes]
+        tau_c_expanded = self.tau_c.to(Q_u.device).unsqueeze(0)  # [1, num_classes]
         above_threshold = (Q_u > tau_c_expanded)  # [batch_size, num_classes] 布尔类型
         
         # 计算每个类别的超阈差值 (预测概率 - 阈值)
@@ -342,7 +334,7 @@ class AdaptiveThresholdTrainer:
         
         # 将未超过阈值的类别差值设为负无穷，确保不会被选择
         margin_values = torch.where(above_threshold, margin_values, 
-                                  torch.tensor(-float('inf'), device=device))
+                                   torch.tensor(-float('inf'), device=Q_u.device))
         
         # 创建全零的伪标签矩阵
         P_u = torch.zeros_like(Q_u)
@@ -358,7 +350,7 @@ class AdaptiveThresholdTrainer:
                 max_margin_value = margin_values[i, max_margin_idx].item()
                 
                 # 只有当最大差值超过容忍边界时，才生成伪标签
-                if max_margin_value > margin_epsilon.item():
+                if max_margin_value > self.margin_epsilon:
                     P_u[i, max_margin_idx] = 1.0
         
         # 创建掩码：有任何一个类别被标记为1的样本
@@ -500,10 +492,7 @@ class AdaptiveThresholdTrainer:
                 valid_mask = mask_batch.bool()
                 valid_indices_in_batch = torch.where(valid_mask)[0]
 
-                # 确保索引在正确的设备上
-                valid_indices_cpu = valid_indices_in_batch.cpu().numpy()
-                
-                for j in valid_indices_cpu: # 迭代有效索引
+                for j in valid_indices_in_batch.cpu().numpy(): # 迭代有效索引
                     if j < len(original_batch_indices): # 确保索引有效且原始索引已找到
                         pseudo_label_class = torch.argmax(P_u_batch[j]).item()
                         confidence = max_probs[j].item()
@@ -578,19 +567,7 @@ class AdaptiveThresholdTrainer:
             logger.warning("没有样本满足添加到有标签集的条件")
 
         # 清理临时加载器和恢复训练模式
-        # 使用locals()查询变量是否存在，防止删除未定义变量引发的错误
-        delete_vars = ['temp_unlabeled_dataset', 'temp_unlabeled_loader', 'class_grouped_samples']
-        to_delete = [var for var in delete_vars if var in locals()]
-        
-        # 添加可能不存在的变量（取决于代码执行路径）
-        for var in ['samples', 'sorted_samples', 'selected_samples']:
-            if var in locals():
-                to_delete.append(var)
-                
-        # 安全删除变量
-        for var in to_delete:
-            del locals()[var]
-            
+        del temp_unlabeled_dataset, temp_unlabeled_loader, class_grouped_samples, samples, sorted_samples, selected_samples
         torch.cuda.empty_cache()
         self.model.train()
         self.graph_model.train()
@@ -857,20 +834,19 @@ class AdaptiveThresholdTrainer:
                 unlabeled_mask = ~labeled_mask
                 
                 # 前向传播（所有样本）
-                # print("phone_ids: ", batch['phone_ids'])
+                print(f"the phone number is {batch['phone_ids']}")
                 outputs = self.model.thinker(**inputs_dict)
                 
-                
+                print(f"the phone number is {batch['phone_ids']}")
                 
                 probabilities = self.get_class_probabilities(outputs)
                 
                 # 计算损失（仅有标签样本）
                 if torch.any(labeled_mask):
                     # 确保掩码在与概率相同的设备上
-                    labeled_mask_device = labeled_mask.to(probabilities.device)
 
                     # 使用正确设备上的掩码
-                    Y_l = probabilities[labeled_mask_device]
+                    Y_l = probabilities[labeled_mask].to(probabilities.device)
                     L_l = labels[labeled_mask].to(probabilities.device)
                     
                     # 计算监督损失 - 使用_compute_losses方法替代直接使用CrossEntropyLoss
@@ -893,14 +869,14 @@ class AdaptiveThresholdTrainer:
                     # 不计算梯度，仅更新阈值
                     with torch.no_grad():
                         # 重新确保掩码在正确的设备上（防止之前的修改被覆盖）
-                        unlabeled_mask_device = unlabeled_mask.to(probabilities.device)
+                        unlabeled_mask_device = unlabeled_mask
                         Q_u = probabilities[unlabeled_mask_device]
 
                         # 更新自适应阈值
                         self._update_adaptive_thresholds(Q_u.to(self.tau.device))
                 
-                        del Q_u, unlabeled_mask_device
-                        torch.cuda.empty_cache()
+                        del Q_u
+                        torch.cuda.empty_cache()                
 
                 # 在梯度累积和优化器步骤后清理内存
                 if (batch_idx + 1) % gradient_accumulation_steps == 0 or batch_idx + 1 == len(train_loader):
@@ -928,6 +904,7 @@ class AdaptiveThresholdTrainer:
                         last_batch_loss = None
                             
                     
+                    del last_batch_loss, current_lr
                     torch.cuda.empty_cache()
 
                 # 更新全局步数
@@ -966,14 +943,8 @@ class AdaptiveThresholdTrainer:
 
                 if self.use_semi_supervised:
                     self.writer.add_scalar("epoch/global_threshold", self.tau.item(), epoch + 1)
-                    # 不再记录平均值，而是为每个类别单独记录阈值
-                    # self.writer.add_scalar("epoch/class_threshold_mean", self.tau_c.mean().item(), epoch + 1)
-                    # self.writer.add_scalar("epoch/class_distribution_mean", self.p_tilde.mean().item(), epoch + 1)
-                    
-                    # 为每个类别单独记录阈值和分布
-                    for class_idx in range(self.num_classes):
-                        self.writer.add_scalar(f"epoch/class_{class_idx}_threshold", self.tau_c[class_idx].item(), epoch + 1)
-                        self.writer.add_scalar(f"epoch/class_{class_idx}_distribution", self.p_tilde[class_idx].item(), epoch + 1)
+                    self.writer.add_scalar("epoch/class_threshold_mean", self.tau_c.mean().item(), epoch + 1)
+                    self.writer.add_scalar("epoch/class_distribution_mean", self.p_tilde.mean().item(), epoch + 1)
             
             # === 保存检查点 ===
             if save_checkpoints and (epoch + 1) % checkpoint_freq == 0:
@@ -1011,6 +982,7 @@ class AdaptiveThresholdTrainer:
                     train_dataset,
                     labeled_indices,
                     unlabeled_indices,
+                    batch_size,
                     accelerator
                 )
                 
@@ -1447,15 +1419,9 @@ class AdaptiveThresholdTrainer:
                 return
             
             # 创建备份
-            try:
-                backup_file = f"{labels_file_path}.bak"
-                shutil.copy2(labels_file_path, backup_file)
-                if os.path.exists(backup_file):
-                    logger.info(f"已创建标签文件备份: {backup_file}")
-                else:
-                    logger.error(f"备份文件创建失败，文件不存在: {backup_file}")
-            except Exception as e:
-                logger.error(f"创建备份时出错: {str(e)}")
+            backup_file = f"{labels_file_path}.bak"
+            shutil.copy2(labels_file_path, backup_file)
+            logger.info(f"已创建标签文件备份: {backup_file}")
             
             # 确定标签列 - 查找名为'label'或包含'label'的列
             label_col_name = None
@@ -1480,7 +1446,7 @@ class AdaptiveThresholdTrainer:
                 pseudo_label = item['label']
                 
                 # 确保标签有效
-                if pseudo_label is None or pseudo_label < 0 or pseudo_label >= self.num_classes:
+                if pseudo_label is None或pseudo_label < 0 or pseudo_label >= self.num_classes:
                     logger.warning(f"样本 {phone_id} 的伪标签 {pseudo_label} 无效，跳过更新")
                     continue
                 
@@ -1624,13 +1590,13 @@ def main(
     graph_config_dict = {
         "token_embedding_dim": llm_hidden_size, # 使用LLM的隐藏层维度
         "output_dim": llm_hidden_size,          # 输出维度与输入保持一致
-        "num_heads": 8,
-        "speaker_embedding_dim": 16,
+        "num_heads": 4,
+        "speaker_embedding_dim": 4,
         "num_speakers": None, # 让模型动态处理
-        "num_layers": 3,
+        "num_layers": 1,
         "dropout": 0.1,
-        "similarity_threshold": 0.9,
-        "context_window_size": 5,
+        "similarity_threshold": 0.8,
+        "context_window_size": 3,
         "dtype": torch.bfloat16 # 使用与主模型相同的精度
     }
     logger.info("图模型配置:")
@@ -1806,7 +1772,7 @@ def parse_args():
     # 基本训练参数
     parser.add_argument("--batch_size", type=int, default=1, 
                         help="批处理大小（默认：1）")
-    parser.add_argument("--num_epochs", type=int, default=20, 
+    parser.add_argument("--num_epochs", type=int, default=50, 
                         help="训练轮数（默认：50）")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, 
                         help="梯度累积步数（默认：1）")
@@ -1834,10 +1800,10 @@ def parse_args():
                         help="初始全局阈值（默认：0.9）")
     parser.add_argument("--top_k_percent", type=float, default=0.05, 
                         help="选择伪标签样本的百分比（默认：0.05）")
-    parser.add_argument("--update_dataset_freq", type=int, default=3, 
-                        help="更新有标签数据集的频率，以epoch为单位（默认：3）")
-    parser.add_argument("--margin_epsilon", type=float, default=0.06,
-                        help="伪标签生成的最小可接受超阈差值（默认：0.06）")
+    parser.add_argument("--update_dataset_freq", type=int, default=4, 
+                        help="更新有标签数据集的频率，以epoch为单位（默认：5）")
+    parser.add_argument("--margin_epsilon", type=float, default=0.1,
+                        help="伪标签生成的最小可接受超阈差值（默认：0.1）")
     
     # 添加控制权重保存的参数
     parser.add_argument("--keep_last_n_checkpoints", type=int, default=2,
@@ -1852,15 +1818,15 @@ def parse_args():
                        help="从指定检查点恢复训练，提供检查点路径（默认：None）")
     
     # 添加学习率和调度器相关参数
-    parser.add_argument("--learning_rate", type=float, default=2e-5, 
-                       help="基础学习率（默认：2e-5）")
-    parser.add_argument("--lora_lr_factor", type=float, default=8, 
-                       help="LoRA学习率倍数，相对于基础学习率（默认：8）")
+    parser.add_argument("--learning_rate", type=float, default=5e-5, 
+                       help="基础学习率（默认：5e-5）")
+    parser.add_argument("--lora_lr_factor", type=float, default=6, 
+                       help="LoRA学习率倍数，相对于基础学习率（默认：6）")
     parser.add_argument("--lr_scheduler_type", type=str, default="linear", 
                        choices=["linear", "cosine", "constant_with_warmup", "cosine_with_restarts"],
                        help="学习率调度器类型（默认：linear）")
-    parser.add_argument("--warmup_ratio", type=float, default=0.12, 
-                       help="warmup阶段占总步数的比例（默认：0.12）")
+    parser.add_argument("--warmup_ratio", type=float, default=0.1, 
+                       help="warmup阶段占总步数的比例（默认：0.1）")
     
     return parser.parse_args()
 
