@@ -16,4 +16,5 @@ asr
 utils/run.py
 data
 qwen2_5_omni_light/__pycache__
-doc/
+
+doc/ECAI.md

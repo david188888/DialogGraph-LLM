@@ -196,27 +196,6 @@ The dataset categorizes customer purchase intentions into four hierarchical leve
 - **Class C (Low Interest)**: Customer shows limited interest, mostly listening without commitment
 - **Class D (No Interest)**: Customer explicitly declines or shows no interest in the product
 
-#### Data Format
-
-```python
-# Example data structure
-{
-    "conversation_id": "13002076272",
-    "audio_path": "data/audio/13002076272.wav", 
-    "transcript": [
-        {"speaker": "agent", "text": "您好，我是XX公司的客服..."},
-        {"speaker": "customer", "text": "你们是做什么的？"},
-        // ... more turns
-    ],
-    "intent_label": "B",  # Moderate Interest
-    "metadata": {
-        "duration": 156.3,
-        "num_turns": 12,
-        "customer_age_group": "middle_aged",
-        "product_category": "insurance"
-    }
-}
-```
 
 ### MIntRec2.0 Benchmark
 
