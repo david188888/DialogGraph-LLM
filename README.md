@@ -4,7 +4,6 @@
   <a href="https://david188888.github.io/Paper//ECAI-2025_paper_8221.pdf">📄 Paper</a> •
     <a href="#-quick-start">🚀 Quick Start</a> •
     <a href="#-results">📊 Results</a> •
-    <a href="#-citation">📝 Citation</a>
 </p>
 
 <div align="center">
