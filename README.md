@@ -1,7 +1,7 @@
 # DialogGraph-LLM: Multi-Relational Graph-Informed LLM for End-to-End Audio Dialogue Intent Recognition
 
 <p align="center">
-    <a href="doc/ECAI-2025_paper_8221.pdf">📄 Paper</a> •
+  <a href="https://david188888.github.io/Paper//ECAI-2025_paper_8221.pdf">📄 Paper</a> •
     <a href="#-quick-start">🚀 Quick Start</a> •
     <a href="#-results">📊 Results</a> •
     <a href="#-citation">📝 Citation</a>
@@ -88,9 +88,9 @@
 git clone git@github.com:david188888/DialogGraph-LLM.git
 cd AudioLLM-Telemarketing
 
-# Create virtual environment
-conda create -n dialoggraph
-conda activate dialoggraph
+# Create and activate a virtual environment
+conda create -n <env_name>
+conda activate <env_name>
 
 # Install dependencies
 pip install -r requirements.txt
@@ -110,10 +110,27 @@ We provide pre-trained models with different backbones and configurations:
 **Note**: All models use LoRA fine-tuning with rank=16, making them memory-efficient and fast to deploy. -->
 
 ## 💻 Usage
+
+### Data Preparation
+Before training, you need to prepare the datasets:
+#### 1. MIntRec2.0 Dataset
+Download the MIntRec2.0 dataset from the official repository:
+```bash
+# Clone the MIntRec2.0 repository
+git clone https://github.com/thuiar/MIntRec2.0.git
+
+# Create data directory and copy dataset
+mkdir -p data
+cp -r MIntRec2.0/data/* data/
+```
+
+Visit the [MIntRec2.0 repository](https://github.com/thuiar/MIntRec2.0) for detailed dataset information and preparation instructions.
+
+#### 2. MarketCalls Dataset
+The **MarketCalls** dataset is currently **not publicly available** as it requires privacy processing for user voice data. We are working on anonymizing the audio data while preserving the conversational patterns essential for intent recognition research.
+
+
 ### Training
-
-#### Full Training with Semi-Supervised Learning
-
 ```bash
 # Train with MarketCalls dataset
 python train.py \
@@ -125,7 +142,6 @@ python train.py \
     --lambda_ema 0.95 \
     --margin_tolerance 0.06
 ```
-
 ## 📊 Results
 
 ### Main Results
@@ -165,90 +181,19 @@ Comparison with state-of-the-art multimodal intent recognition methods:
 - Strong performance on both in-scope and out-of-scope detection
 
 
-#### Training Efficiency
-
-- **Memory Usage**: ~24GB GPU memory for Qwen2.5-Omni-7B with LoRA
-- **Training Time**: ~8 hours on 4×A100 GPUs for MarketCalls
-- **Inference Speed**: ~150ms per dialogue on single GPU
-
-
-
-## 📁 Datasets
-
-### MarketCalls Dataset
-
-Our **MarketCalls** dataset contains **8,770 real-world telemarketing conversations** in Mandarin, representing authentic interactions between sales representatives and potential customers across various companies.
-
-#### Dataset Statistics
-
-| Split | Conversations | Total Duration | Avg Length | Label Distribution |
-|-------|---------------|----------------|------------|-------------------|
-| Train | 6,216 (70.9%) | ~180 hours | 104.3s | A: 8.2%, B: 41.3%, C: 38.9%, D: 11.6% |
-| Val | 1,327 (15.1%) | ~38 hours | 103.7s | A: 8.1%, B: 41.7%, C: 38.5%, D: 11.7% |
-| Test | 1,227 (14.0%) | ~35 hours | 105.1s | A: 8.3%, B: 40.9%, C: 39.2%, D: 11.6% |
-
-#### Intent Categories
-
-The dataset categorizes customer purchase intentions into four hierarchical levels:
-
-- **Class A (Strong Interest)**: Customer shows clear purchase intent and requests detailed information
-- **Class B (Moderate Interest)**: Customer expresses interest but has concerns or conditions  
-- **Class C (Low Interest)**: Customer shows limited interest, mostly listening without commitment
-- **Class D (No Interest)**: Customer explicitly declines or shows no interest in the product
-
-
-### MIntRec2.0 Benchmark
-
-We evaluate on the **MIntRec2.0** dataset, a large-scale benchmark for multimodal intent recognition in multi-party conversations, to demonstrate the generalizability of our approach.
-
-#### Key Characteristics
-- **30 intent classes** covering diverse conversational scenarios
-- **In-scope vs Out-of-scope** detection capabilities
-- **Multi-party conversations** with complex interaction patterns
-- **Multimodal annotations** including text, audio, and video
-
 ## 🤝 Contributing
-
-We welcome contributions from the community! Here's how you can help improve DialogGraph-LLM:
-
-### Types of Contributions
-
-- 🐛 **Bug Reports**: Report issues or unexpected behaviors
-- 💡 **Feature Requests**: Suggest new features or improvements  
-- 📝 **Documentation**: Improve documentation and examples
-- 🔬 **Research**: Extend the framework to new domains or tasks
-- 🎯 **Benchmarks**: Add support for new datasets or evaluation metrics
-
-### Development Setup
-
-```bash
-# Fork and clone the repository
-git clone https://github.com/your-username/AudioLLM-Telemarketing.git
-cd AudioLLM-Telemarketing
-
-# Create development environment
-conda create -n dialoggraph-dev python=3.9
-conda activate dialoggraph-dev
-pip install -e ".[dev]"
-
-# Install pre-commit hooks
-pre-commit install
-```
-
-
-
-
-## 📄 License
-
-This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
-
+We welcome contributions from the community! Here's how you can help improve DialogGraph-LLM
 
 ## 🙏 Acknowledgments
 
 We gratefully acknowledge the following contributions and support:
+
+- **[Qwen2.5-Omni](https://github.com/QwenLM/Qwen2.5-Omni)**: This project builds upon the outstanding **Qwen2.5-Omni-7B** multimodal foundation model developed by the Qwen Team at Alibaba Cloud. Qwen2.5-Omni is an end-to-end multimodal model capable of perceiving diverse modalities including text, images, audio, and video while generating natural speech responses. The model is released under the [Apache-2.0 License](https://github.com/QwenLM/Qwen2.5-Omni/blob/main/LICENSE), and we extend our sincere gratitude to the Qwen team for making this powerful model available to the research community.
+
+- **[MIntRec2.0](https://github.com/thuiar/MIntRec2.0)**: We acknowledge the use of the **MIntRec2.0** dataset, a large-scale benchmark for multimodal intent recognition and out-of-scope detection in multi-party conversations. This comprehensive dataset contains 15,040 utterances across 30 intent classes with text, video, and audio modalities, providing an essential resource for evaluating multimodal intent recognition approaches. The dataset is released under the [CC-BY-NC-SA-4.0 License](https://creativecommons.org/licenses/by-nc-sa/4.0/), and we are grateful to the authors for their valuable contribution to the multimodal intent recognition research community.
 ---
 
 
 **🌟 Star us on GitHub if you find this project helpful! 🌟**
 For questions, issues, or collaborations, please:
-📧 **Email**: [hongyuliu@m.scnu.edu.cn](hongyuliu@m.scnu.edu.cn)
+📧 **Email**: [hongyuliu@m.scnu.edu.cn](hongyuliu@m.scnu.edu.cn) or [junxinli@m.scnu.edu.cn](junxinli@m.scnu.edu.cn)
