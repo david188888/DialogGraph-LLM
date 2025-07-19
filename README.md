@@ -18,7 +18,7 @@
 
 ## 🔥 News
 
-<!-- - **2025.07** - 🎉 Paper accepted to **ECAI 2025**! -->
+- **2025.07.10** - 🎉 Paper accepted to **ECAI 2025**!
 <!-- - **2025.08** - 📊 Released **MarketCalls** dataset with 8,770 real-world telemarketing conversations -->
 - **2025.06.24** - 📝 Paper review scores: 7 (good, probably should be accepted), 8 (very good top 50% of all accepted papers at top AI conferences over the years), 6 (borderline (but tending towards acceptance), 7
 - **2025.04** - 🚀 Code is publicly available
